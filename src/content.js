@@ -787,6 +787,59 @@
       }
 
       if (!found) {
+        if (options.historyMode) {
+          const ref = saved && saved.nearbyAnchors && saved.nearbyAnchors[0];
+          const beforeScrollY = Math.round(window.scrollY);
+          let reason = '';
+          let best = null;
+          let delta = null;
+
+          if (!ref) {
+            reason = 'no-nearby-anchor';
+          } else {
+            const result = await findBestCandidate(saved, { historyMode: true });
+            best = result.best;
+
+            if (!best) {
+              reason = 'no-best-candidate';
+            } else if (typeof ref.absTop !== 'number' || typeof best.absTop !== 'number') {
+              reason = 'missing-absTop';
+            } else {
+              delta = best.absTop - ref.absTop;
+
+              if (Math.abs(delta) > 30 && Math.abs(delta) < 3000) {
+                window.scrollBy(0, delta);
+                await addLog('info', 'history:relative-offset-corrected', {
+                  sessionId,
+                  tweetId: saved.tweetId,
+                  referenceTweetId: ref.tweetId,
+                  bestTweetId: best.info && best.info.tweetId,
+                  referenceAbsTop: ref.absTop,
+                  bestAbsTop: best.absTop,
+                  delta,
+                  beforeScrollY,
+                  afterScrollY: Math.round(window.scrollY)
+                });
+              } else {
+                reason = 'delta-out-of-range';
+              }
+            }
+          }
+
+          if (reason) {
+            await addLog('info', 'history:relative-offset-skipped', {
+              sessionId,
+              tweetId: saved.tweetId,
+              reason,
+              referenceTweetId: ref && ref.tweetId,
+              bestTweetId: best && best.info && best.info.tweetId,
+              referenceAbsTop: ref && ref.absTop,
+              bestAbsTop: best && best.absTop,
+              delta
+            });
+          }
+        }
+
         if (options.historyMode && typeof saved.scrollY === 'number' && saved.scrollY > 0) {
           window.scrollTo(0, saved.scrollY);
           await addLog('info', 'history:preserve-scrollY', {
