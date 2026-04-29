@@ -1,0 +1,8 @@
+{
+  "extName": {
+    "message": "X Feed Anchor Restore"
+  },
+  "extDescription": {
+    "message": "Save and restore X timeline position using tweet anchors. Local-only storage."
+  }
+}
