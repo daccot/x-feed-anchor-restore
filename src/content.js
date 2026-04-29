@@ -420,6 +420,27 @@
     return true;
   }
 
+  function findTweetById(tweetId) {
+    const id = String(tweetId || '').replace(/\D/g, '');
+    if (!id) return null;
+
+    const selectors = [
+      `a[href*="/status/${id}"]`,
+      `div[data-testid="cellInnerDiv"] a[href*="/status/${id}"]`,
+      `article a[href*="/status/${id}"]`
+    ];
+
+    for (const selector of selectors) {
+      const links = [...document.querySelectorAll(selector)];
+      for (const link of links) {
+        const article = link.closest('article') || link.closest('div[data-testid="cellInnerDiv"]') || link.closest('[data-testid="tweet"]');
+        if (article) return article;
+      }
+    }
+
+    return null;
+  }
+
   function scoreCandidate(article, saved) {
     const info = statusInfo(article);
     if (!info || !saved) return { score: -1 };
@@ -451,8 +472,8 @@
     }
 
     const snippetSim = textSimilarity(articleSnippet, saved.snippet);
-    if (snippetSim > 0) {
-      const v = Math.round(snippetSim * 35);
+    if (snippetSim > 0.2) {
+      const v = Math.round(snippetSim * 40);
       score += v;
       reasons.push(`snippet:+${v}`);
     }
@@ -520,6 +541,27 @@
       snippet: articleSnippet,
       reasons
     };
+  }
+
+  function isReliableCandidate(candidate, saved) {
+    const reasons = candidate && Array.isArray(candidate.reasons) ? candidate.reasons : [];
+
+    const get = (prefix) => {
+      const reason = reasons.find((x) => x.startsWith(prefix));
+      if (!reason) return 0;
+      const match = reason.match(/\+(\d+)/);
+      return match ? Number(match[1]) : 0;
+    };
+
+    const has = (prefix) => reasons.some((x) => x.startsWith(prefix));
+
+    if (has('tweetId:+')) return true;
+    if (has('nearbyTweetId:+')) return true;
+    if (get('nearbySnippet:+') >= 18) return true;
+    if (get('nearbyAuthor:+') >= 12 && get('nearbyAbsTop:+') >= 20) return true;
+    if (get('snippet:+') >= 18) return true;
+
+    return false;
   }
 
   async function findBestCandidate(saved, options = {}) {
@@ -752,6 +794,39 @@
 
       boundedSearchIndex = didScrollFallback ? 1 : 0;
 
+      async function tryMicroExactSearch() {
+        if (options.historyMode || typeof saved.scrollY !== 'number' || !saved.tweetId) {
+          return false;
+        }
+
+        const offsets = [0, -300, 300, -700, 700];
+        for (const offset of offsets) {
+          window.scrollTo(0, Math.max(0, saved.scrollY + offset));
+          await sleep(150);
+          const exact = findTweetById(saved.tweetId);
+          if (!exact) continue;
+
+          const adjusted = await adjustToTarget(exact, saved, sessionId, `micro-exact:${offset}`);
+          if (adjusted.cancelled) {
+            return false;
+          }
+
+          found = true;
+          setStatus(`${t('restored')}: ${saved.tweetId}`);
+          await addLog('info', 'restore:micro-exact-found', {
+            sessionId,
+            tweetId: saved.tweetId,
+            offset,
+            scrollY: Math.round(window.scrollY),
+            adjusted
+          });
+          scheduleDriftCheck(exact, saved, sessionId);
+          return true;
+        }
+
+        return false;
+      }
+
       async function tryRelativeOffsetCorrection(mode) {
         const eventPrefix = mode === 'history' ? 'history' : 'restore';
         const ref = saved && saved.nearbyAnchors && saved.nearbyAnchors[0];
@@ -759,6 +834,7 @@
         let reason = '';
         let best = null;
         let delta = null;
+        let reliable = false;
 
         if (!ref) {
           reason = 'no-nearby-anchor';
@@ -773,8 +849,11 @@
           } else {
             delta = best.absTop - ref.absTop;
             const predictedScrollY = beforeScrollY + delta;
+            reliable = isReliableCandidate(best, saved);
 
-            if (mode === 'restore' &&
+            if (!reliable) {
+              reason = 'weak-candidate';
+            } else if (mode === 'restore' &&
                 typeof saved.scrollY === 'number' &&
                 Math.abs(predictedScrollY - saved.scrollY) >= 2500) {
               reason = 'predicted-scroll-too-far';
@@ -785,11 +864,15 @@
                 tweetId: saved.tweetId,
                 referenceTweetId: ref.tweetId,
                 bestTweetId: best.info && best.info.tweetId,
+                savedTweetId: saved.tweetId,
+                score: best.score,
                 referenceAbsTop: ref.absTop,
                 bestAbsTop: best.absTop,
                 delta,
                 beforeScrollY,
-                afterScrollY: Math.round(window.scrollY)
+                afterScrollY: Math.round(window.scrollY),
+                reasons: best.reasons,
+                isReliableCandidate: true
               });
               setStatus(t('restoredByScroll'));
               return true;
@@ -805,9 +888,12 @@
           reason,
           referenceTweetId: ref && ref.tweetId,
           bestTweetId: best && best.info && best.info.tweetId,
+          savedTweetId: saved.tweetId,
+          score: best && best.score,
           referenceAbsTop: ref && ref.absTop,
           bestAbsTop: best && best.absTop,
-          delta
+          delta,
+          reasons: best && best.reasons
         });
         return false;
       }
@@ -920,6 +1006,13 @@
       }
 
       if (!found) {
+        if (!options.historyMode) {
+          const microExactFound = await tryMicroExactSearch();
+          if (microExactFound) {
+            return true;
+          }
+        }
+
         const relativeCorrected = await tryRelativeOffsetCorrection(options.historyMode ? 'history' : 'restore');
         if (relativeCorrected) {
           return options.historyMode;
