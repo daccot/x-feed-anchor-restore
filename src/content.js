@@ -53,6 +53,9 @@
     restoreSessionId: 0,
     restoreStartedAt: 0,
     restoreCancelled: false,
+    restoreLockUntil: 0,
+    lastManualHistoryRestoreAt: 0,
+    activeRestoreReason: null,
     initialStarted: false,
     lastUserInputAt: 0,
     ui: {
@@ -384,6 +387,12 @@
   }
 
   async function savePosition(reason = 'auto') {
+    if (now() < state.restoreLockUntil ||
+        now() - state.lastManualHistoryRestoreAt < 5000) {
+      await addLog('info', 'save:suppressed-by-restore-lock', { reason });
+      return false;
+    }
+
     if (state.restoring && !String(reason).startsWith('manual')) {
       await addLog('info', 'save:suppressed-during-restore', { reason });
       return false;
@@ -712,6 +721,14 @@
   async function restoreAnchorObject(saved, reason = 'history') {
     if (!saved) return false;
 
+    state.lastManualHistoryRestoreAt = now();
+    state.restoreLockUntil = now() + 5000;
+    state.activeRestoreReason = 'history';
+
+    await addLog('info', 'restore:lock-started', {
+      lockUntil: state.restoreLockUntil
+    });
+
     await addLog('info', 'history:click', {
       tweetId: saved.tweetId,
       routeKey: saved.routeKey,
@@ -746,6 +763,12 @@
 
   async function restorePosition(reason = 'auto', options = {}) {
     if (!state.settings.autoRestore && reason === 'auto') return false;
+    if (!options.historyMode &&
+        now() < state.restoreLockUntil &&
+        state.activeRestoreReason === 'history') {
+      await addLog('info', 'restore:skipped-due-to-history-lock', { reason });
+      return false;
+    }
 
     const routeKey = getRouteKey();
     if (!isSupportedRoute(routeKey) && !options.explicitSaved) {
@@ -763,9 +786,12 @@
     }
 
     const sessionId = ++state.restoreSessionId;
+    const sessionStartedAt = now();
+    const isInitialPassive = reason === 'initial-fast' || reason === 'initial-refine';
     state.restoring = true;
     state.restoreCancelled = false;
-    state.restoreStartedAt = now();
+    state.restoreStartedAt = sessionStartedAt;
+    state.activeRestoreReason = options.historyMode ? 'history' : reason;
 
     if (!options.silent) {
       setStatus(t('loading'), 3000);
@@ -837,6 +863,34 @@
         }
 
         await sleep(options.fast ? 60 : 160);
+      }
+
+      if (isInitialPassive) {
+        const exact = findExactCandidate(saved.tweetId);
+        if (exact) {
+          const adjusted = await adjustToTarget(exact, saved, sessionId, 'initial-passive-exact');
+          if (!adjusted.cancelled) {
+            found = true;
+            setStatus(`${t('restored')}: ${saved.tweetId}`);
+            await addLog('info', 'restore:micro-exact-found', {
+              sessionId,
+              tweetId: saved.tweetId,
+              offset: 0,
+              scrollY: Math.round(window.scrollY),
+              adjusted
+            });
+            scheduleDriftCheck(exact, saved, sessionId);
+            return true;
+          }
+        }
+
+        await addLog('info', 'restore:initial-passive-fallback', {
+          sessionId,
+          reason,
+          savedScrollY: saved.scrollY
+        });
+        setStatus(t('restoredByScroll'));
+        return false;
       }
 
       boundedSearchIndex = didScrollFallback ? 1 : 0;
@@ -948,6 +1002,13 @@
       const started = now();
 
       while (now() - started < CONFIG.restoreTimeoutMs) {
+        if (sessionId !== state.restoreSessionId) {
+          return false;
+        }
+        if (!options.historyMode && state.lastManualHistoryRestoreAt > sessionStartedAt) {
+          await addLog('info', 'restore:aborted-by-newer-history-restore', {});
+          return false;
+        }
         if (restoreCancelled(sessionId)) {
           await addLog('warn', 'restore:cancelled', { sessionId, attempts });
           return false;
@@ -1113,6 +1174,9 @@
         if (sessionId === state.restoreSessionId) {
           state.restoring = false;
           state.restoreCancelled = false;
+          if (now() >= state.restoreLockUntil) {
+            state.activeRestoreReason = null;
+          }
         }
       }, 700);
     }
