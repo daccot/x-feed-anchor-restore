@@ -1,17 +1,13 @@
-/*
- * X Feed Anchor Restore - content.js
- * Manifest V3 content script for X.com/Twitter.com feed anchor save & restore.
- */
 (() => {
   'use strict';
 
-  const APP = 'X Feed Anchor Restore';
-  const PREFIX = `[${APP}]`;
-  const STORAGE_KEYS = {
+  const PREFIX = '[X Feed Anchor Restore]';
+  const KEYS = {
     SETTINGS: 'xfar_settings',
     POSITIONS: 'xfar_positions',
     HISTORY: 'xfar_history',
-    LAST_ROUTE: 'xfar_last_route'
+    LOGS: 'xfar_logs',
+    COMMAND: 'xfar_command'
   };
 
   const DEFAULT_SETTINGS = {
@@ -21,488 +17,400 @@
     enableSearch: true,
     enableLists: true,
     enableOtherTimelines: true,
-    historyLimit: 10,
-    debug: false,
+    historyLimit: 20,
+    debug: true,
     language: 'auto'
   };
 
-  const STATE = {
+  const state = {
     settings: { ...DEFAULT_SETTINGS },
-    currentUrl: location.href,
-    currentRouteKey: '',
+    routeKey: '',
+    url: location.href,
     saveTimer: null,
     routeTimer: null,
-    mutationObserver: null,
-    isRestoring: false,
-    lastSavedAnchor: null,
-    lastUserIntentAt: 0,
+    restoring: false,
     lastScrollY: window.scrollY,
-    pendingNoticeTimer: null,
-    ui: { root: null, button: null, panel: null, notice: null }
+    lastUserInputAt: 0,
+    ui: { root: null, button: null, status: null, debug: null },
+    mo: null
   };
 
-  function log(type, ...args) {
-    if (!STATE.settings.debug) return;
-    console.log(PREFIX, type, ...args);
-  }
+  const now = () => Date.now();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const get = (keys) => new Promise((r) => chrome.storage.local.get(keys, r));
+  const set = (obj) => new Promise((r) => chrome.storage.local.set(obj, r));
 
-  function now() { return Date.now(); }
-
-  function storageGet(keys) {
-    return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
-  }
-
-  function storageSet(data) {
-    return new Promise((resolve) => chrome.storage.local.set(data, resolve));
-  }
-
-  function getBrowserLanguage() {
-    const lang = (navigator.language || 'en').toLowerCase();
-    return lang.startsWith('ja') ? 'ja' : 'en';
-  }
-
-  function getLanguage() {
-    if (STATE.settings.language === 'ja' || STATE.settings.language === 'en') return STATE.settings.language;
-    return getBrowserLanguage();
-  }
-
-  function t(key) {
-    const lang = getLanguage();
-    const dict = {
-      ja: {
-        button: '前の位置へ',
-        noticeRestore: '保存位置に戻る',
-        noticeFailed: '保存済みポストが見つかりませんでした',
-        historyTitle: '保存履歴',
-        noHistory: '履歴なし'
-      },
-      en: {
-        button: 'Back to saved post',
-        noticeRestore: 'Back to saved post',
-        noticeFailed: 'Saved post was not found',
-        historyTitle: 'Saved positions',
-        noHistory: 'No history'
-      }
+  async function addLog(level, event, detail = {}) {
+    const entry = {
+      time: new Date().toISOString(),
+      level,
+      event,
+      routeKey: state.routeKey || getRouteKey(),
+      url: location.href,
+      scrollY: Math.round(window.scrollY),
+      detail
     };
-    return (dict[lang] && dict[lang][key]) || dict.en[key] || key;
+    if (state.settings.debug) console.log(PREFIX, entry);
+    const data = await get([KEYS.LOGS]);
+    const logs = Array.isArray(data[KEYS.LOGS]) ? data[KEYS.LOGS] : [];
+    logs.unshift(entry);
+    await set({ [KEYS.LOGS]: logs.slice(0, 300) });
+    updateDebug(entry);
   }
 
-  function normalizeRouteKey(urlString = location.href) {
-    const url = new URL(urlString);
-    const path = url.pathname;
-    if (path === '/home' || path === '/') return '/home';
-    if (path === '/search') {
-      const q = url.searchParams.get('q') || '';
-      const f = url.searchParams.get('f') || '';
-      return `/search?q=${encodeURIComponent(q)}${f ? `&f=${encodeURIComponent(f)}` : ''}`;
+  function lang() {
+    if (state.settings.language === 'ja' || state.settings.language === 'en') return state.settings.language;
+    return (navigator.language || '').toLowerCase().startsWith('ja') ? 'ja' : 'en';
+  }
+
+  function text(key) {
+    const ja = {
+      restore: '前の位置へ',
+      save: '現在位置を保存',
+      saved: '保存しました',
+      restored: '復元しました',
+      notFound: 'アンカー未検出。スクロール位置で復元しました',
+      noSaved: '保存位置なし'
+    };
+    const en = {
+      restore: 'Back to saved post',
+      save: 'Save position now',
+      saved: 'Saved',
+      restored: 'Restored',
+      notFound: 'Anchor not found. Restored by scroll position.',
+      noSaved: 'No saved position'
+    };
+    return (lang() === 'ja' ? ja : en)[key] || key;
+  }
+
+  function getRouteKey(urlString = location.href) {
+    const u = new URL(urlString);
+    const p = u.pathname;
+    if (p === '/' || p === '/home') return '/home';
+    if (p === '/search') {
+      return '/search?q=' + encodeURIComponent(u.searchParams.get('q') || '') + '&f=' + encodeURIComponent(u.searchParams.get('f') || '');
     }
-    const listMatch = path.match(/^\/i\/lists\/([^/]+)/);
-    if (listMatch) return `/i/lists/${listMatch[1]}`;
-    const statusMatch = path.match(/^\/([^/]+)\/status\/(\d+)/);
-    if (statusMatch) return `/status/${statusMatch[2]}`;
-    return path;
+    const list = p.match(/^\/i\/lists\/([^/]+)/);
+    if (list) return '/i/lists/' + list[1];
+    const status = p.match(/^\/([^/]+)\/status\/(\d+)/);
+    if (status) return '/status/' + status[2];
+    return p;
   }
 
-  function isSupportedRoute(routeKey = normalizeRouteKey()) {
-    if (routeKey === '/home') return STATE.settings.enableHome;
-    if (routeKey.startsWith('/search')) return STATE.settings.enableSearch;
-    if (routeKey.startsWith('/i/lists/')) return STATE.settings.enableLists;
+  function supported(routeKey = getRouteKey()) {
+    if (routeKey === '/home') return state.settings.enableHome;
+    if (routeKey.startsWith('/search')) return state.settings.enableSearch;
+    if (routeKey.startsWith('/i/lists/')) return state.settings.enableLists;
     if (routeKey.startsWith('/status/')) return false;
-    return STATE.settings.enableOtherTimelines;
+    return state.settings.enableOtherTimelines;
   }
 
-  function queryTweetArticles() {
-    const direct = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+  function articles() {
+    const direct = [...document.querySelectorAll('article[data-testid="tweet"]')];
     if (direct.length) return direct;
-    const cells = Array.from(document.querySelectorAll('div[data-testid="cellInnerDiv"]'));
-    const articles = [];
-    for (const cell of cells) {
-      const article = cell.querySelector('article');
-      if (article) articles.push(article);
-    }
-    return articles;
+    return [...document.querySelectorAll('div[data-testid="cellInnerDiv"] article')];
   }
 
-  function extractTweetIdFromHref(href) {
-    if (!href) return null;
-    const match = href.match(/\/status\/(\d+)/);
-    return match ? match[1] : null;
-  }
-
-  function findStatusLink(article) {
-    const links = Array.from(article.querySelectorAll('a[href*="/status/"]'));
-    for (const link of links) {
-      const href = link.href || link.getAttribute('href') || '';
-      const tweetId = extractTweetIdFromHref(href);
-      if (tweetId) return { href, tweetId };
+  function statusInfo(article) {
+    const links = [...article.querySelectorAll('a[href*="/status/"]')];
+    for (const a of links) {
+      const href = a.href || a.getAttribute('href') || '';
+      const m = href.match(/\/status\/(\d+)/);
+      if (m) return { tweetId: m[1], href };
     }
     return null;
   }
 
-  function extractSnippet(article) {
-    const textNode = article.querySelector('[data-testid="tweetText"]');
-    const text = (textNode ? textNode.innerText : article.innerText || '').replace(/\s+/g, ' ').trim();
-    return text.slice(0, 160);
-  }
-
-  function extractAuthor(article) {
-    const userName = article.querySelector('[data-testid="User-Name"]');
-    const text = (userName ? userName.innerText : '').replace(/\s+/g, ' ').trim();
-    return text.slice(0, 120);
-  }
-
-  function getFixedHeaderHeight() {
-    const candidates = Array.from(document.querySelectorAll('[role="banner"], header, div[data-testid="TopNavBar"]'));
-    let max = 0;
-    for (const el of candidates) {
-      const style = getComputedStyle(el);
-      if (style.position !== 'fixed' && style.position !== 'sticky') continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.top <= 5 && rect.bottom > 0 && rect.height < 200) max = Math.max(max, rect.height);
+  function headerHeight() {
+    let h = 0;
+    for (const el of document.querySelectorAll('[role="banner"], header')) {
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      if ((s.position === 'fixed' || s.position === 'sticky') && r.top <= 5 && r.height < 180) h = Math.max(h, r.height);
     }
-    return Math.round(max);
+    return Math.round(h);
   }
 
-  function getVisibleAnchor() {
-    if (!isSupportedRoute()) return null;
-    const articles = queryTweetArticles();
-    if (!articles.length) {
-      log('anchor:not-found', 'no articles');
-      return null;
-    }
+  function snippet(article) {
+    const t = article.querySelector('[data-testid="tweetText"]');
+    return ((t && t.innerText) || article.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+  }
+
+  function author(article) {
+    const u = article.querySelector('[data-testid="User-Name"]');
+    return ((u && u.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+  }
+
+  function visibleAnchor() {
+    if (!supported()) return null;
+    const hs = headerHeight();
+    const vh = window.innerHeight || 800;
     let best = null;
-    let bestDistance = Number.POSITIVE_INFINITY;
-    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 800;
-    const headerOffset = getFixedHeaderHeight();
-    for (const article of articles) {
-      const rect = article.getBoundingClientRect();
-      if (rect.bottom <= headerOffset || rect.top >= viewportHeight) continue;
-      const status = findStatusLink(article);
-      if (!status || !status.tweetId) continue;
-      const distance = Math.abs(rect.top - headerOffset);
-      if (distance < bestDistance) {
-        bestDistance = distance;
+    let bestDist = Infinity;
+    const list = articles();
+    for (const a of list) {
+      const r = a.getBoundingClientRect();
+      if (r.bottom <= hs || r.top >= vh) continue;
+      const info = statusInfo(a);
+      if (!info) continue;
+      const d = Math.abs(r.top - hs);
+      if (d < bestDist) {
+        bestDist = d;
         best = {
-          tweetId: status.tweetId,
-          href: status.href,
-          routeKey: normalizeRouteKey(),
-          offsetTopFromViewport: Math.round(rect.top - headerOffset),
+          tweetId: info.tweetId,
+          href: info.href,
+          routeKey: getRouteKey(),
+          offsetTopFromViewport: Math.round(r.top - hs),
           scrollY: Math.round(window.scrollY),
           savedAt: now(),
-          snippet: extractSnippet(article),
-          author: extractAuthor(article)
+          author: author(a),
+          snippet: snippet(a),
+          articleCount: list.length,
+          headerHeight: hs
         };
       }
     }
-    if (!best) log('anchor:not-found', 'no visible tweet id');
     return best;
   }
 
-  async function saveCurrentAnchor(reason = 'scroll') {
-    const anchor = getVisibleAnchor();
-    if (!anchor) return false;
-    const data = await storageGet([STORAGE_KEYS.POSITIONS, STORAGE_KEYS.HISTORY]);
-    const positions = data[STORAGE_KEYS.POSITIONS] || {};
-    const history = Array.isArray(data[STORAGE_KEYS.HISTORY]) ? data[STORAGE_KEYS.HISTORY] : [];
-    positions[anchor.routeKey] = anchor;
-    const deduped = history.filter((item) => !(item.routeKey === anchor.routeKey && item.tweetId === anchor.tweetId));
-    deduped.unshift(anchor);
-    const limit = Math.max(1, Math.min(Number(STATE.settings.historyLimit) || 10, 50));
-    const nextHistory = deduped.slice(0, limit);
-    STATE.lastSavedAnchor = anchor;
-    await storageSet({
-      [STORAGE_KEYS.POSITIONS]: positions,
-      [STORAGE_KEYS.HISTORY]: nextHistory,
-      [STORAGE_KEYS.LAST_ROUTE]: anchor.routeKey
-    });
-    log('save', reason, anchor);
+  async function savePosition(reason = 'auto') {
+    const a = visibleAnchor();
+    const routeKey = getRouteKey();
+    if (!a) {
+      await addLog('warn', 'save:no-anchor', { reason, routeKey, articleCount: articles().length });
+      return false;
+    }
+    const data = await get([KEYS.POSITIONS, KEYS.HISTORY]);
+    const positions = data[KEYS.POSITIONS] || {};
+    const history = Array.isArray(data[KEYS.HISTORY]) ? data[KEYS.HISTORY] : [];
+    positions[routeKey] = a;
+    const nextHistory = [a, ...history.filter((x) => !(x.routeKey === a.routeKey && x.tweetId === a.tweetId))].slice(0, state.settings.historyLimit || 20);
+    await set({ [KEYS.POSITIONS]: positions, [KEYS.HISTORY]: nextHistory });
+    setStatus(text('saved') + ': ' + a.routeKey);
+    await addLog('info', 'save:ok', { reason, anchor: a });
     return true;
   }
 
-  function scheduleSave(reason = 'scroll', delay = 500) {
-    if (STATE.isRestoring) return;
-    clearTimeout(STATE.saveTimer);
-    STATE.saveTimer = setTimeout(() => saveCurrentAnchor(reason), delay);
-  }
-
-  function findArticleByTweetId(tweetId) {
-    const id = String(tweetId).replace(/[^\d]/g, '');
+  function findArticle(tweetId) {
+    const id = String(tweetId || '').replace(/\D/g, '');
+    if (!id) return null;
     const link = document.querySelector(`a[href*="/status/${id}"]`);
     if (!link) return null;
     return link.closest('article') || link.closest('div[data-testid="cellInnerDiv"]');
   }
 
-  async function getSavedAnchorForRoute(routeKey = normalizeRouteKey()) {
-    const data = await storageGet([STORAGE_KEYS.POSITIONS]);
-    const positions = data[STORAGE_KEYS.POSITIONS] || {};
-    return positions[routeKey] || null;
-  }
-
-  async function restoreForCurrentRoute(reason = 'auto', explicitAnchor = null) {
-    if (!STATE.settings.autoRestore && reason !== 'manual' && reason !== 'history') return false;
-    const routeKey = normalizeRouteKey();
-    if (!isSupportedRoute(routeKey) && reason !== 'history') return false;
-    const anchor = explicitAnchor || await getSavedAnchorForRoute(routeKey);
-    if (!anchor || !anchor.tweetId) {
-      log('restore:skip', reason, 'no anchor', routeKey);
+  async function restorePosition(reason = 'auto') {
+    if (!state.settings.autoRestore && reason === 'auto') return false;
+    const routeKey = getRouteKey();
+    if (!supported(routeKey)) {
+      await addLog('info', 'restore:skip-unsupported-route', { reason, routeKey });
       return false;
     }
-    log('restore:start', reason, anchor);
-    const ok = await waitAndScrollToAnchor(anchor, reason);
-    if (!ok && reason === 'manual') showNotice(t('noticeFailed'), false);
-    return ok;
-  }
-
-  function waitAndScrollToAnchor(anchor, reason) {
-    return new Promise((resolve) => {
-      const startedAt = now();
-      const timeoutMs = 10000;
-      let attempts = 0;
-      let done = false;
-      let observer = null;
-      let interval = null;
-      const finish = (ok) => {
-        if (done) return;
-        done = true;
-        if (interval) clearInterval(interval);
-        if (observer) observer.disconnect();
-        STATE.isRestoring = false;
-        log(ok ? 'restore:success' : 'restore:failed', reason, anchor, { attempts });
-        resolve(ok);
-      };
-      const tryRestore = () => {
-        attempts += 1;
-        const target = findArticleByTweetId(anchor.tweetId);
-        if (!target) {
-          if (now() - startedAt > timeoutMs) finish(false);
-          return;
-        }
-        STATE.isRestoring = true;
-        target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
-        requestAnimationFrame(() => {
-          const header = getFixedHeaderHeight();
-          const desired = Number(anchor.offsetTopFromViewport) || 0;
-          const rect = target.getBoundingClientRect();
-          const delta = Math.round((rect.top - header) - desired);
-          if (Math.abs(delta) > 2) window.scrollBy(0, delta);
-          stabilizeRestore(target, anchor, startedAt);
-          finish(true);
-        });
-      };
-      observer = new MutationObserver(() => { if (!done) tryRestore(); });
-      observer.observe(document.body, { childList: true, subtree: true });
-      interval = setInterval(tryRestore, 250);
-      tryRestore();
-    });
-  }
-
-  function stabilizeRestore(target, anchor, startedAt) {
-    const durationMs = 1800;
-    const tick = () => {
-      if (now() - startedAt > durationMs) return;
-      if (!document.contains(target)) return;
-      const header = getFixedHeaderHeight();
-      const desired = Number(anchor.offsetTopFromViewport) || 0;
-      const rect = target.getBoundingClientRect();
-      const delta = Math.round((rect.top - header) - desired);
-      if (Math.abs(delta) > 12) window.scrollBy(0, delta);
-      requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
-  }
-
-  function markUserIntent() { STATE.lastUserIntentAt = now(); }
-
-  function shouldOfferJumpRecovery(currentY, previousY, delta) {
-    if (!STATE.lastSavedAnchor) return false;
-    if (STATE.lastSavedAnchor.routeKey !== normalizeRouteKey()) return false;
-    if (now() - STATE.lastSavedAnchor.savedAt > 5000) return false;
-    if (now() - STATE.lastUserIntentAt < 1500) return false;
-    if (previousY < 800) return false;
-    if (currentY > previousY) return false;
-    return Math.abs(delta) > 700 || currentY < previousY * 0.35;
-  }
-
-  function onScroll() {
-    const currentY = window.scrollY;
-    const previousY = STATE.lastScrollY;
-    const delta = currentY - previousY;
-    STATE.lastScrollY = currentY;
-    scheduleSave('scroll', 500);
-    if (STATE.settings.autoRestore && shouldOfferJumpRecovery(currentY, previousY, delta)) {
-      showNotice(t('noticeRestore'), true);
+    const data = await get([KEYS.POSITIONS]);
+    const saved = (data[KEYS.POSITIONS] || {})[routeKey];
+    if (!saved) {
+      await addLog('warn', 'restore:no-saved-position', { reason, routeKey });
+      setStatus(text('noSaved'));
+      return false;
     }
+
+    state.restoring = true;
+    await addLog('info', 'restore:start', { reason, saved });
+
+    // First fallback: raw scrollY. This is imperfect but useful when the anchor is not loaded yet after reload.
+    if (typeof saved.scrollY === 'number' && saved.scrollY > 0) {
+      window.scrollTo(0, saved.scrollY);
+      await addLog('info', 'restore:fallback-scrollY', { scrollY: saved.scrollY });
+    }
+
+    const started = now();
+    let found = false;
+    let attempts = 0;
+
+    while (now() - started < 12000) {
+      attempts++;
+      const target = findArticle(saved.tweetId);
+      if (target) {
+        const hs = headerHeight();
+        target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
+        await sleep(60);
+        const r = target.getBoundingClientRect();
+        const desired = Number(saved.offsetTopFromViewport) || 0;
+        const delta = Math.round((r.top - hs) - desired);
+        if (Math.abs(delta) > 2) window.scrollBy(0, delta);
+        found = true;
+        setStatus(text('restored') + ': ' + saved.tweetId);
+        await addLog('info', 'restore:anchor-ok', { attempts, tweetId: saved.tweetId, delta });
+        break;
+      }
+      if (attempts === 8 && typeof saved.scrollY === 'number') window.scrollTo(0, saved.scrollY);
+      await sleep(300);
+    }
+
+    if (!found) {
+      setStatus(text('notFound'));
+      await addLog('warn', 'restore:anchor-not-found', { attempts, tweetId: saved.tweetId, scrollY: saved.scrollY, articleCount: articles().length });
+    }
+
+    setTimeout(() => { state.restoring = false; }, 800);
+    return found;
   }
 
-  function showNotice(message, withAction) {
+  function scheduleSave(reason) {
+    if (state.restoring) return;
+    clearTimeout(state.saveTimer);
+    state.saveTimer = setTimeout(() => savePosition(reason), 700);
+  }
+
+  function setStatus(msg) {
     ensureUI();
-    if (!STATE.ui.notice) return;
-    STATE.ui.notice.textContent = message;
-    STATE.ui.notice.style.display = 'block';
-    STATE.ui.notice.onclick = withAction ? () => restoreForCurrentRoute('manual') : null;
-    clearTimeout(STATE.pendingNoticeTimer);
-    STATE.pendingNoticeTimer = setTimeout(() => {
-      if (STATE.ui.notice) STATE.ui.notice.style.display = 'none';
-    }, 6000);
+    if (state.ui.status) state.ui.status.textContent = msg;
+  }
+
+  function updateDebug(entry) {
+    ensureUI();
+    if (!state.ui.debug) return;
+    state.ui.debug.textContent = entry ? `${entry.level} ${entry.event}\n${entry.routeKey}\nY=${entry.scrollY}` : '';
   }
 
   function ensureUI() {
-    if (!STATE.settings.showButton) { removeUI(); return; }
-    if (STATE.ui.root && document.contains(STATE.ui.root)) return;
+    if (!state.settings.showButton) return;
+    if (state.ui.root && document.contains(state.ui.root)) return;
+
     const root = document.createElement('div');
     root.id = 'xfar-root';
-    root.style.cssText = 'position:fixed;right:16px;bottom:18px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;line-height:1.35;color:#0f1419';
-    const notice = document.createElement('div');
-    notice.style.cssText = 'display:none;margin-bottom:8px;padding:8px 10px;border-radius:999px;background:rgba(15,20,25,.92);color:#fff;box-shadow:0 4px 16px rgba(0,0,0,.22);cursor:pointer;max-width:260px;text-align:center';
-    const panel = document.createElement('div');
-    panel.style.cssText = 'display:none;width:320px;max-height:360px;overflow:auto;margin-bottom:8px;border:1px solid rgba(83,100,113,.25);border-radius:14px;background:rgba(255,255,255,.98);box-shadow:0 8px 28px rgba(0,0,0,.24);padding:10px';
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = t('button');
-    button.title = `${t('button')} / Shift+Click: ${t('historyTitle')}`;
-    button.style.cssText = 'border:1px solid rgba(83,100,113,.35);border-radius:999px;background:rgba(255,255,255,.94);color:#0f1419;padding:8px 12px;font-weight:700;box-shadow:0 4px 16px rgba(0,0,0,.18);cursor:pointer;backdrop-filter:blur(8px)';
-    button.addEventListener('click', (event) => {
-      event.preventDefault(); event.stopPropagation();
-      if (event.shiftKey) toggleHistoryPanel();
-      else restoreForCurrentRoute('manual');
-    });
-    root.appendChild(notice); root.appendChild(panel); root.appendChild(button);
+    root.style.cssText = 'position:fixed;right:16px;bottom:18px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:12px;color:#0f1419;display:flex;flex-direction:column;gap:6px;align-items:flex-end;';
+
+    const status = document.createElement('div');
+    status.style.cssText = 'max-width:280px;background:rgba(15,20,25,.92);color:#fff;padding:6px 9px;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.2);display:none;white-space:pre-wrap;';
+
+    const debug = document.createElement('pre');
+    debug.style.cssText = 'max-width:280px;background:rgba(255,255,255,.94);border:1px solid rgba(83,100,113,.35);padding:6px 8px;border-radius:10px;margin:0;display:none;white-space:pre-wrap;';
+
+    const box = document.createElement('div');
+    box.style.cssText = 'display:flex;gap:6px;';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = text('save');
+    saveBtn.style.cssText = btnStyle();
+    saveBtn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); savePosition('manual-button'); };
+
+    const restoreBtn = document.createElement('button');
+    restoreBtn.textContent = text('restore');
+    restoreBtn.style.cssText = btnStyle();
+    restoreBtn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); restorePosition('manual-button'); };
+
+    box.appendChild(saveBtn);
+    box.appendChild(restoreBtn);
+    root.appendChild(status);
+    root.appendChild(debug);
+    root.appendChild(box);
     document.documentElement.appendChild(root);
-    STATE.ui.root = root; STATE.ui.button = button; STATE.ui.panel = panel; STATE.ui.notice = notice;
+
+    state.ui.root = root;
+    state.ui.status = status;
+    state.ui.debug = debug;
+    state.ui.button = restoreBtn;
+
+    state.ui.status.style.display = 'block';
+    if (state.settings.debug) state.ui.debug.style.display = 'block';
   }
 
-  function removeUI() {
-    if (STATE.ui.root && STATE.ui.root.parentNode) STATE.ui.root.parentNode.removeChild(STATE.ui.root);
-    STATE.ui.root = null; STATE.ui.button = null; STATE.ui.panel = null; STATE.ui.notice = null;
-  }
-
-  function escapeHtml(value) {
-    return String(value || '').replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
-  }
-
-  async function toggleHistoryPanel() {
-    ensureUI();
-    const panel = STATE.ui.panel;
-    if (!panel) return;
-    if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
-    const data = await storageGet([STORAGE_KEYS.HISTORY]);
-    const history = Array.isArray(data[STORAGE_KEYS.HISTORY]) ? data[STORAGE_KEYS.HISTORY] : [];
-    panel.innerHTML = '';
-    const title = document.createElement('div');
-    title.textContent = t('historyTitle');
-    title.style.cssText = 'font-weight:800;margin:0 0 8px;font-size:14px;';
-    panel.appendChild(title);
-    if (!history.length) {
-      const empty = document.createElement('div');
-      empty.textContent = t('noHistory');
-      empty.style.cssText = 'color:#536471;padding:8px 0;';
-      panel.appendChild(empty);
-    }
-    for (const item of history) {
-      const row = document.createElement('button');
-      row.type = 'button';
-      const date = new Date(item.savedAt || Date.now()).toLocaleString();
-      row.innerHTML = `<strong>${escapeHtml(item.routeKey || '')}</strong><br><span>${escapeHtml(item.author || '')}</span><br><small>${escapeHtml(item.snippet || item.tweetId || '')}</small><br><small>${escapeHtml(date)}</small>`;
-      row.style.cssText = 'display:block;width:100%;text-align:left;border:0;border-top:1px solid rgba(83,100,113,.18);background:transparent;padding:8px 4px;cursor:pointer;color:#0f1419';
-      row.addEventListener('click', (event) => {
-        event.preventDefault(); event.stopPropagation(); panel.style.display = 'none';
-        if (normalizeRouteKey() !== item.routeKey && item.routeKey && !item.routeKey.startsWith('/status/')) {
-          history.pushState({}, '', item.routeKey);
-          handleRouteChange('history-panel');
-          setTimeout(() => restoreForCurrentRoute('history', item), 700);
-        } else {
-          restoreForCurrentRoute('history', item);
-        }
-      });
-      panel.appendChild(row);
-    }
-    panel.style.display = 'block';
+  function btnStyle() {
+    return 'border:1px solid rgba(83,100,113,.35);border-radius:999px;background:rgba(255,255,255,.96);color:#0f1419;padding:7px 10px;font-weight:700;box-shadow:0 4px 16px rgba(0,0,0,.18);cursor:pointer;';
   }
 
   function patchHistory() {
-    if (window.__xfarHistoryPatched) return;
-    window.__xfarHistoryPatched = true;
-    const originalPushState = history.pushState;
-    const originalReplaceState = history.replaceState;
-    history.pushState = function patchedPushState(...args) {
-      saveCurrentAnchor('before-pushState');
-      const result = originalPushState.apply(this, args);
-      setTimeout(() => handleRouteChange('pushState'), 0);
-      return result;
+    if (window.__xfarPatched) return;
+    window.__xfarPatched = true;
+    const ps = history.pushState;
+    const rs = history.replaceState;
+    history.pushState = function(...args) {
+      savePosition('before-pushState');
+      const ret = ps.apply(this, args);
+      setTimeout(() => routeChanged('pushState'), 50);
+      return ret;
     };
-    history.replaceState = function patchedReplaceState(...args) {
-      const result = originalReplaceState.apply(this, args);
-      setTimeout(() => handleRouteChange('replaceState'), 0);
-      return result;
+    history.replaceState = function(...args) {
+      const ret = rs.apply(this, args);
+      setTimeout(() => routeChanged('replaceState'), 50);
+      return ret;
     };
     window.addEventListener('popstate', () => {
-      saveCurrentAnchor('before-popstate');
-      setTimeout(() => handleRouteChange('popstate'), 60);
+      setTimeout(() => routeChanged('popstate'), 80);
     });
   }
 
-  function handleRouteChange(reason) {
-    if (STATE.currentUrl === location.href) return;
-    const oldUrl = STATE.currentUrl;
-    STATE.currentUrl = location.href;
-    STATE.currentRouteKey = normalizeRouteKey();
-    log('route', reason, { oldUrl, newUrl: location.href, routeKey: STATE.currentRouteKey });
-    ensureUI();
-    clearTimeout(STATE.routeTimer);
-    STATE.routeTimer = setTimeout(() => restoreForCurrentRoute(reason), 700);
+  function routeChanged(reason) {
+    if (state.url === location.href) return;
+    const old = state.url;
+    state.url = location.href;
+    state.routeKey = getRouteKey();
+    addLog('info', 'route:changed', { reason, old, next: state.url, routeKey: state.routeKey });
+    clearTimeout(state.routeTimer);
+    state.routeTimer = setTimeout(() => restorePosition('route-' + reason), 900);
   }
 
-  function setupMutationObserver() {
-    if (STATE.mutationObserver) STATE.mutationObserver.disconnect();
-    STATE.mutationObserver = new MutationObserver(() => {
-      if (STATE.currentUrl !== location.href) handleRouteChange('mutation-url');
+  function observeRoute() {
+    if (state.mo) state.mo.disconnect();
+    state.mo = new MutationObserver(() => {
+      if (state.url !== location.href) routeChanged('mutation');
       ensureUI();
     });
-    STATE.mutationObserver.observe(document.documentElement, { childList: true, subtree: true });
+    state.mo.observe(document.documentElement, { childList: true, subtree: true });
   }
 
-  function setupEventListeners() {
-    window.addEventListener('scroll', onScroll, { passive: true });
-    window.addEventListener('keydown', (event) => {
-      if (['Home', 'PageUp', 'PageDown', 'End', 'ArrowUp', 'ArrowDown', 'Space'].includes(event.code)) markUserIntent();
-    }, true);
-    window.addEventListener('wheel', markUserIntent, { passive: true, capture: true });
-    window.addEventListener('touchstart', markUserIntent, { passive: true, capture: true });
-    document.addEventListener('click', (event) => {
-      markUserIntent();
-      const target = event.target instanceof Element ? event.target : null;
-      const link = target ? target.closest('a[href*="/status/"]') : null;
-      if (link && isSupportedRoute()) saveCurrentAnchor('before-status-click');
-    }, true);
-    window.addEventListener('load', () => setTimeout(() => restoreForCurrentRoute('load'), 900));
+  function listenCommands() {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local') return;
+      if (changes[KEYS.SETTINGS]) {
+        state.settings = { ...DEFAULT_SETTINGS, ...(changes[KEYS.SETTINGS].newValue || {}) };
+        addLog('info', 'settings:changed', state.settings);
+        if (state.ui.debug) state.ui.debug.style.display = state.settings.debug ? 'block' : 'none';
+      }
+      if (changes[KEYS.COMMAND] && changes[KEYS.COMMAND].newValue) {
+        const cmd = changes[KEYS.COMMAND].newValue;
+        if (cmd.action === 'save') savePosition('popup-command');
+        if (cmd.action === 'restore') restorePosition('popup-command');
+      }
+    });
   }
 
   async function loadSettings() {
-    const data = await storageGet([STORAGE_KEYS.SETTINGS]);
-    STATE.settings = { ...DEFAULT_SETTINGS, ...(data[STORAGE_KEYS.SETTINGS] || {}) };
+    const data = await get([KEYS.SETTINGS]);
+    state.settings = { ...DEFAULT_SETTINGS, ...(data[KEYS.SETTINGS] || {}) };
   }
-
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== 'local') return;
-    if (changes[STORAGE_KEYS.SETTINGS]) {
-      STATE.settings = { ...DEFAULT_SETTINGS, ...(changes[STORAGE_KEYS.SETTINGS].newValue || {}) };
-      log('settings:changed', STATE.settings);
-      ensureUI();
-      if (STATE.ui.button) STATE.ui.button.textContent = t('button');
-    }
-  });
 
   async function init() {
     await loadSettings();
-    STATE.currentRouteKey = normalizeRouteKey();
+    state.routeKey = getRouteKey();
     patchHistory();
-    setupEventListeners();
-    setupMutationObserver();
+    observeRoute();
+    listenCommands();
     ensureUI();
-    scheduleSave('init', 1200);
-    setTimeout(() => restoreForCurrentRoute('init'), 1200);
-    log('init', { routeKey: STATE.currentRouteKey, settings: STATE.settings });
+
+    window.addEventListener('scroll', () => {
+      state.lastScrollY = window.scrollY;
+      scheduleSave('scroll');
+    }, { passive: true });
+
+    window.addEventListener('wheel', () => { state.lastUserInputAt = now(); }, { passive: true, capture: true });
+    window.addEventListener('touchstart', () => { state.lastUserInputAt = now(); }, { passive: true, capture: true });
+    window.addEventListener('keydown', () => { state.lastUserInputAt = now(); }, true);
+
+    document.addEventListener('click', (e) => {
+      state.lastUserInputAt = now();
+      const target = e.target instanceof Element ? e.target : null;
+      const link = target ? target.closest('a[href*="/status/"]') : null;
+      if (link && supported()) savePosition('before-status-click');
+    }, true);
+
+    await addLog('info', 'init', { routeKey: state.routeKey, articleCount: articles().length, settings: state.settings });
+    setTimeout(() => savePosition('initial-scan'), 1200);
+    setTimeout(() => restorePosition('initial-load'), 1800);
   }
 
-  init().catch((error) => console.error(PREFIX, 'init:error', error));
+  init().catch((e) => {
+    console.error(PREFIX, e);
+  });
 })();
