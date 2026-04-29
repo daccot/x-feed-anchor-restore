@@ -793,6 +793,7 @@
           let reason = '';
           let best = null;
           let delta = null;
+          let relativeCorrected = false;
 
           if (!ref) {
             reason = 'no-nearby-anchor';
@@ -809,6 +810,7 @@
 
               if (Math.abs(delta) > 30 && Math.abs(delta) < 3000) {
                 window.scrollBy(0, delta);
+                relativeCorrected = true;
                 await addLog('info', 'history:relative-offset-corrected', {
                   sessionId,
                   tweetId: saved.tweetId,
@@ -824,6 +826,11 @@
                 reason = 'delta-out-of-range';
               }
             }
+          }
+
+          if (relativeCorrected) {
+            setStatus(t('restoredByScroll'));
+            return true;
           }
 
           if (reason) {
