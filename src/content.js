@@ -12,7 +12,7 @@
 
   const DEFAULT_SETTINGS = {
     autoRestore: true,
-    showButton: true,
+    showButton: false,
     enableHome: true,
     enableSearch: true,
     enableLists: true,
@@ -35,7 +35,7 @@
     nearbyLimit: 16,
     initialMinArticles: 10,
     initialReadyTimeoutMs: 12000,
-    initialRetryMax: 3,
+    initialRetryMax: 2,
     initialRetryBaseDelayMs: 900
   };
 
@@ -50,7 +50,6 @@
     restoreSessionId: 0,
     restoreStartedAt: 0,
     restoreCancelled: false,
-    timelineReadyObserver: null,
     timelineReadyStarted: false,
     lastScrollY: window.scrollY,
     lastUserInputAt: 0,
@@ -58,9 +57,7 @@
     mo: null
   };
 
-  try {
-    if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
-  } catch (_) {}
+  try { if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; } catch (_) {}
 
   const now = () => Date.now();
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -169,11 +166,6 @@
     return ((u && u.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 100);
   }
 
-  function makeAnchorFromItem(item, hs, list, visible, fullyVisible, reason) {
-    const r = item.rect;
-    return { tweetId: item.info.tweetId, href: item.info.href, routeKey: getRouteKey(), offsetTopFromViewport: Math.round(r.top - hs), scrollY: Math.round(window.scrollY), savedAt: now(), author: author(item.article), snippet: snippet(item.article), articleCount: list.length, visibleCount: visible.length, fullyVisibleCount: fullyVisible.length, headerHeight: hs, viewportHeight: window.innerHeight || 800, selectedRect: rectToObject(r), selectedTextLength: item.textLength, selectionReason: reason };
-  }
-
   function visibleAnchor() {
     if (!supported()) return null;
     const hs = headerHeight();
@@ -211,9 +203,8 @@
 
     preferred.sort((a, b) => b.textLength !== a.textLength ? b.textLength - a.textLength : a.distanceFromTop - b.distanceFromTop);
     const best = preferred[0];
-    const anchor = makeAnchorFromItem(best, hs, list, visible, fullyVisible, fullyVisible.length >= 2 ? 'prefer-2nd-or-3rd-fully-visible-long-text' : 'fallback-visible-candidate');
-    anchor.nearbyAnchors = nearby.slice(0, RESTORE.nearbyLimit);
-
+    const r = best.rect;
+    const anchor = { tweetId: best.info.tweetId, href: best.info.href, routeKey: getRouteKey(), offsetTopFromViewport: Math.round(r.top - hs), scrollY: Math.round(window.scrollY), savedAt: now(), author: author(best.article), snippet: snippet(best.article), articleCount: list.length, visibleCount: visible.length, fullyVisibleCount: fullyVisible.length, headerHeight: hs, viewportHeight: vh, selectedRect: rectToObject(r), selectedTextLength: best.textLength, selectionReason: fullyVisible.length >= 2 ? 'prefer-2nd-or-3rd-fully-visible-long-text' : 'fallback-visible-candidate', nearbyAnchors: nearby.slice(0, RESTORE.nearbyLimit) };
     addLog('info', 'anchor:selected', { tweetId: anchor.tweetId, routeKey: anchor.routeKey, selectionReason: anchor.selectionReason, selectedRect: anchor.selectedRect, nearbyCount: anchor.nearbyAnchors.length, visibleCount: anchor.visibleCount, fullyVisibleCount: anchor.fullyVisibleCount });
     return anchor;
   }
@@ -269,7 +260,6 @@
 
   async function waitForTimelineReady(reason) {
     const started = now();
-    setStatus(text('waitingTimeline'), RESTORE.loadingStatusMs);
     await addLog('info', 'timeline-ready:wait-start', { reason, minArticles: RESTORE.initialMinArticles });
     return new Promise((resolve) => {
       let done = false;
@@ -315,7 +305,7 @@
     return { cancelled: false, delta1, delta2, finalRect: rectToObject(rect3) };
   }
 
-  async function restorePosition(reason = 'auto') {
+  async function restorePosition(reason = 'auto', options = {}) {
     if (!state.settings.autoRestore && reason === 'auto') return false;
     const routeKey = getRouteKey();
     if (!supported(routeKey)) {
@@ -329,25 +319,25 @@
       setStatus(text('noSaved'), RESTORE.statusMinVisibleMs);
       return false;
     }
-
     const sessionId = ++state.restoreSessionId;
     state.restoring = true;
     state.restoreCancelled = false;
     state.restoreStartedAt = now();
-    setStatus(text('loading'), RESTORE.loadingStatusMs);
-    await addLog('info', 'restore:start', { reason, sessionId, saved, scrollRestoration: history.scrollRestoration, articleCount: articles().length });
-
+    if (!options.silent) setStatus(text('loading'), RESTORE.loadingStatusMs);
+    await addLog('info', 'restore:start', { reason, sessionId, saved, scrollRestoration: history.scrollRestoration, articleCount: articles().length, fast: Boolean(options.fast) });
     let didScrollFallback = false;
     let found = false;
     let attempts = 0;
     let virtualLoadSteps = 0;
-
     try {
       if (typeof saved.scrollY === 'number' && saved.scrollY > 0) {
         window.scrollTo(0, saved.scrollY);
         didScrollFallback = true;
-        await addLog('info', 'restore:fallback-scrollY', { sessionId, scrollY: saved.scrollY });
-        await sleep(180);
+        await addLog('info', 'restore:fallback-scrollY', { sessionId, scrollY: saved.scrollY, fast: Boolean(options.fast) });
+        if (options.fast) {
+          setStatus(text('restoredByScroll'), RESTORE.statusMinVisibleMs);
+        }
+        await sleep(options.fast ? 60 : 180);
       }
       const started = now();
       while (now() - started < RESTORE.timeoutMs) {
@@ -403,23 +393,23 @@
     }
   }
 
-  async function initialRestoreWithRetry() {
+  async function fastInitialRestoreThenRefine() {
     if (!supported()) return;
     if (state.timelineReadyStarted) return;
     state.timelineReadyStarted = true;
-    const ready = await waitForTimelineReady('initial-load');
+    await restorePosition('initial-fast', { fast: true, silent: true });
+    const ready = await waitForTimelineReady('initial-refine');
     for (let i = 1; i <= RESTORE.initialRetryMax; i++) {
       const delay = i === 1 ? 0 : RESTORE.initialRetryBaseDelayMs * (i - 1);
       if (delay) await sleep(delay);
-      setStatus(`${text('loading')} (${i}/${RESTORE.initialRetryMax})`, RESTORE.loadingStatusMs);
-      await addLog('info', 'initial-restore:attempt', { attempt: i, ready, articleCount: articles().length, delay });
-      const ok = await restorePosition('initial-load');
+      await addLog('info', 'initial-refine:attempt', { attempt: i, ready, articleCount: articles().length, delay });
+      const ok = await restorePosition('initial-refine', { silent: true });
       if (ok) {
-        await addLog('info', 'initial-restore:success', { attempt: i });
+        await addLog('info', 'initial-refine:success', { attempt: i });
         return true;
       }
     }
-    await addLog('warn', 'initial-restore:failed-after-retry', { retryMax: RESTORE.initialRetryMax, articleCount: articles().length });
+    await addLog('warn', 'initial-refine:failed-after-retry', { retryMax: RESTORE.initialRetryMax, articleCount: articles().length });
     return false;
   }
 
@@ -447,7 +437,10 @@
   }
 
   function ensureUI() {
-    if (!state.settings.showButton) return;
+    if (!state.settings.showButton) {
+      removeUI();
+      return;
+    }
     if (state.ui.root && document.contains(state.ui.root)) return;
     const root = document.createElement('div');
     root.id = 'xfar-root';
@@ -482,6 +475,11 @@
     if (state.settings.debug) state.ui.debug.style.display = 'block';
   }
 
+  function removeUI() {
+    if (state.ui.root && state.ui.root.parentNode) state.ui.root.parentNode.removeChild(state.ui.root);
+    state.ui = { root: null, saveButton: null, restoreButton: null, status: null, debug: null };
+  }
+
   function buttonStyle() {
     return 'border:1px solid rgba(83,100,113,.35);border-radius:999px;background:rgba(255,255,255,.96);color:#0f1419;padding:7px 10px;font-weight:700;box-shadow:0 4px 16px rgba(0,0,0,.18);cursor:pointer;';
   }
@@ -513,7 +511,7 @@
     state.timelineReadyStarted = false;
     addLog('info', 'route:changed', { reason, old, next: state.url, routeKey: state.routeKey });
     clearTimeout(state.routeTimer);
-    state.routeTimer = setTimeout(() => restorePosition(`route-${reason}`), 900);
+    state.routeTimer = setTimeout(() => restorePosition(`route-${reason}`), 500);
   }
 
   function observeRoute() {
@@ -528,6 +526,7 @@
       if (changes[KEYS.SETTINGS]) {
         state.settings = { ...DEFAULT_SETTINGS, ...(changes[KEYS.SETTINGS].newValue || {}) };
         addLog('info', 'settings:changed', state.settings);
+        ensureUI();
         if (state.ui.debug) state.ui.debug.style.display = state.settings.debug ? 'block' : 'none';
       }
       if (changes[KEYS.COMMAND] && changes[KEYS.COMMAND].newValue) {
@@ -569,7 +568,7 @@
       if (link && supported()) savePosition('before-status-click');
     }, true);
     await addLog('info', 'init', { routeKey: state.routeKey, articleCount: articles().length, settings: state.settings, scrollRestoration: history.scrollRestoration });
-    initialRestoreWithRetry();
+    fastInitialRestoreThenRefine();
   }
 
   init().catch((error) => console.error(PREFIX, error));
