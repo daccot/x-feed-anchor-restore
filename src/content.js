@@ -36,7 +36,10 @@
     initialMinArticles: 10,
     initialReadyTimeoutMs: 12000,
     initialRetryMax: 2,
-    initialRetryBaseDelayMs: 900
+    initialRetryBaseDelayMs: 900,
+    driftCheckDelayMs: 900,
+    driftThresholdPx: 180,
+    driftMaxCorrections: 2
   };
 
   const state = {
@@ -46,14 +49,18 @@
     saveTimer: null,
     routeTimer: null,
     statusTimer: null,
+    driftTimer: null,
     restoring: false,
     restoreSessionId: 0,
     restoreStartedAt: 0,
     restoreCancelled: false,
     timelineReadyStarted: false,
+    lastRestoreTarget: null,
+    lastRestoreSaved: null,
+    driftCorrectionCount: 0,
     lastScrollY: window.scrollY,
     lastUserInputAt: 0,
-    ui: { root: null, saveButton: null, restoreButton: null, status: null, debug: null },
+    ui: { root: null, saveButton: null, restoreButton: null, historyButton: null, status: null, debug: null, historyPanel: null },
     mo: null
   };
 
@@ -67,6 +74,10 @@
   function rectToObject(rect) {
     if (!rect) return null;
     return { top: Math.round(rect.top), right: Math.round(rect.right), bottom: Math.round(rect.bottom), left: Math.round(rect.left), width: Math.round(rect.width), height: Math.round(rect.height) };
+  }
+
+  function escapeHtml(value) {
+    return String(value || '').replace(/[&<>\"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
   }
 
   async function addLog(level, event, detail = {}) {
@@ -85,8 +96,8 @@
   }
 
   function text(key) {
-    const ja = { restore: '前の位置へ', save: '現在位置を保存', saved: '保存しました', restored: '復元しました', restoredByScroll: 'スクロール位置で復元しました', loading: '復元中...', waitingTimeline: 'タイムライン読み込み待機中...', notFound: 'アンカー未検出。スクロール位置で復元しました', noSaved: '保存位置なし', cancelled: 'ユーザー操作により復元を中断しました' };
-    const en = { restore: 'Back to saved post', save: 'Save position now', saved: 'Saved', restored: 'Restored', restoredByScroll: 'Restored by scroll position', loading: 'Loading...', waitingTimeline: 'Waiting for timeline...', notFound: 'Anchor not found. Restored by scroll position.', noSaved: 'No saved position', cancelled: 'Restore cancelled by user action' };
+    const ja = { restore: '前の位置へ', save: '現在位置を保存', history: '履歴', saved: '保存しました', restored: '復元しました', restoredByScroll: 'スクロール位置で復元しました', loading: '復元中...', waitingTimeline: 'タイムライン読み込み待機中...', notFound: 'アンカー未検出。スクロール位置で復元しました', noSaved: '保存位置なし', cancelled: 'ユーザー操作により復元を中断しました', historyTitle: '復元履歴', noHistory: '履歴なし', corrected: 'ズレを補正しました' };
+    const en = { restore: 'Back', save: 'Save', history: 'History', saved: 'Saved', restored: 'Restored', restoredByScroll: 'Restored by scroll position', loading: 'Loading...', waitingTimeline: 'Waiting for timeline...', notFound: 'Anchor not found. Restored by scroll position.', noSaved: 'No saved position', cancelled: 'Restore cancelled by user action', historyTitle: 'Restore history', noHistory: 'No history', corrected: 'Drift corrected' };
     return (lang() === 'ja' ? ja : en)[key] || key;
   }
 
@@ -305,15 +316,51 @@
     return { cancelled: false, delta1, delta2, finalRect: rectToObject(rect3) };
   }
 
+  function scheduleDriftCheck(target, saved, sessionId) {
+    clearTimeout(state.driftTimer);
+    if (!target || !saved) return;
+    state.lastRestoreTarget = target;
+    state.lastRestoreSaved = saved;
+    state.driftTimer = setTimeout(async () => {
+      if (state.restoring || restoreCancelled(sessionId)) return;
+      if (now() - state.lastUserInputAt < 1200) return;
+      if (!document.contains(target)) return;
+      const hs = headerHeight();
+      const rect = target.getBoundingClientRect();
+      const desired = Number(saved.offsetTopFromViewport) || 0;
+      const drift = Math.round((rect.top - hs) - desired);
+      if (Math.abs(drift) >= RESTORE.driftThresholdPx && state.driftCorrectionCount < RESTORE.driftMaxCorrections) {
+        state.driftCorrectionCount++;
+        window.scrollBy(0, drift);
+        setStatus(text('corrected'), RESTORE.statusMinVisibleMs);
+        await addLog('info', 'drift:auto-corrected', { sessionId, drift, correctionCount: state.driftCorrectionCount, rect: rectToObject(rect), desiredOffset: desired });
+        scheduleDriftCheck(target, saved, sessionId);
+      } else {
+        await addLog('info', 'drift:checked', { sessionId, drift, correctionCount: state.driftCorrectionCount, rect: rectToObject(rect), desiredOffset: desired });
+      }
+    }, RESTORE.driftCheckDelayMs);
+  }
+
+  async function restoreAnchorObject(saved, reason = 'history') {
+    if (!saved) return false;
+    if (saved.routeKey && saved.routeKey !== getRouteKey() && !saved.routeKey.startsWith('/status/')) {
+      history.pushState({}, '', saved.routeKey);
+      state.url = location.href;
+      state.routeKey = getRouteKey();
+      await sleep(600);
+    }
+    return restorePosition(reason, { explicitSaved: saved });
+  }
+
   async function restorePosition(reason = 'auto', options = {}) {
     if (!state.settings.autoRestore && reason === 'auto') return false;
     const routeKey = getRouteKey();
-    if (!supported(routeKey)) {
+    if (!supported(routeKey) && !options.explicitSaved) {
       await addLog('info', 'restore:skip-unsupported-route', { reason, routeKey });
       return false;
     }
     const data = await get([KEYS.POSITIONS]);
-    const saved = (data[KEYS.POSITIONS] || {})[routeKey];
+    const saved = options.explicitSaved || (data[KEYS.POSITIONS] || {})[routeKey];
     if (!saved) {
       await addLog('warn', 'restore:no-saved-position', { reason, routeKey });
       setStatus(text('noSaved'), RESTORE.statusMinVisibleMs);
@@ -323,6 +370,7 @@
     state.restoring = true;
     state.restoreCancelled = false;
     state.restoreStartedAt = now();
+    state.driftCorrectionCount = 0;
     if (!options.silent) setStatus(text('loading'), RESTORE.loadingStatusMs);
     await addLog('info', 'restore:start', { reason, sessionId, saved, scrollRestoration: history.scrollRestoration, articleCount: articles().length, fast: Boolean(options.fast) });
     let didScrollFallback = false;
@@ -334,9 +382,7 @@
         window.scrollTo(0, saved.scrollY);
         didScrollFallback = true;
         await addLog('info', 'restore:fallback-scrollY', { sessionId, scrollY: saved.scrollY, fast: Boolean(options.fast) });
-        if (options.fast) {
-          setStatus(text('restoredByScroll'), RESTORE.statusMinVisibleMs);
-        }
+        if (options.fast) setStatus(text('restoredByScroll'), RESTORE.statusMinVisibleMs);
         await sleep(options.fast ? 60 : 180);
       }
       const started = now();
@@ -362,6 +408,7 @@
           found = true;
           setStatus(`${text('restored')}: ${saved.tweetId}`, RESTORE.statusMinVisibleMs);
           await addLog('info', 'restore:anchor-ok', { sessionId, attempts, targetSource, tweetId: saved.tweetId, adjusted });
+          scheduleDriftCheck(target, saved, sessionId);
           break;
         }
         if (attempts === 5 && typeof saved.scrollY === 'number' && saved.scrollY > 0) {
@@ -436,11 +483,35 @@
     state.ui.debug.textContent = entry ? [`${entry.level} ${entry.event}`, `route=${entry.routeKey}`, `Y=${entry.scrollY}`, `time=${entry.time}`].join('\n') : '';
   }
 
-  function ensureUI() {
-    if (!state.settings.showButton) {
-      removeUI();
-      return;
+  async function toggleHistoryPanel() {
+    ensureUI();
+    const panel = state.ui.historyPanel;
+    if (!panel) return;
+    if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+    const data = await get([KEYS.HISTORY]);
+    const history = Array.isArray(data[KEYS.HISTORY]) ? data[KEYS.HISTORY] : [];
+    panel.innerHTML = `<div style="font-weight:700;margin-bottom:8px;">${escapeHtml(text('historyTitle'))}</div>`;
+    if (!history.length) {
+      panel.innerHTML += `<div style="color:#536471;padding:8px 0;">${escapeHtml(text('noHistory'))}</div>`;
     }
+    history.slice(0, state.settings.historyLimit || 20).forEach((item) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.style.cssText = 'display:block;width:100%;text-align:left;border:0;border-top:1px solid rgba(83,100,113,.25);background:transparent;color:#0f1419;padding:8px 4px;cursor:pointer;';
+      const date = item.savedAt ? new Date(item.savedAt).toLocaleString() : '';
+      row.innerHTML = `<strong>${escapeHtml(item.routeKey || '')}</strong><br><small>${escapeHtml(item.author || '')}</small><br><span>${escapeHtml(item.snippet || item.tweetId || '')}</span><br><small>${escapeHtml(date)}</small>`;
+      row.addEventListener('click', (event) => {
+        event.preventDefault(); event.stopPropagation();
+        panel.style.display = 'none';
+        restoreAnchorObject(item, 'history-panel');
+      });
+      panel.appendChild(row);
+    });
+    panel.style.display = 'block';
+  }
+
+  function ensureUI() {
+    if (!state.settings.showButton) { removeUI(); return; }
     if (state.ui.root && document.contains(state.ui.root)) return;
     const root = document.createElement('div');
     root.id = 'xfar-root';
@@ -449,35 +520,29 @@
     status.style.cssText = 'max-width:300px;background:rgba(15,20,25,.92);color:#fff;padding:7px 10px;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.2);display:none;white-space:pre-wrap;';
     const debug = document.createElement('pre');
     debug.style.cssText = 'max-width:300px;background:rgba(255,255,255,.94);border:1px solid rgba(83,100,113,.35);padding:6px 8px;border-radius:10px;margin:0;display:none;white-space:pre-wrap;';
+    const historyPanel = document.createElement('div');
+    historyPanel.style.cssText = 'display:none;width:340px;max-height:420px;overflow:auto;background:rgba(255,255,255,.98);border:1px solid rgba(83,100,113,.35);border-radius:14px;box-shadow:0 8px 28px rgba(0,0,0,.24);padding:10px;';
     const box = document.createElement('div');
     box.style.cssText = 'display:flex;gap:6px;';
     const saveButton = document.createElement('button');
-    saveButton.type = 'button';
-    saveButton.textContent = text('save');
-    saveButton.style.cssText = buttonStyle();
+    saveButton.type = 'button'; saveButton.textContent = text('save'); saveButton.style.cssText = buttonStyle();
     saveButton.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); savePosition('manual-button'); });
     const restoreButton = document.createElement('button');
-    restoreButton.type = 'button';
-    restoreButton.textContent = text('restore');
-    restoreButton.style.cssText = buttonStyle();
+    restoreButton.type = 'button'; restoreButton.textContent = text('restore'); restoreButton.style.cssText = buttonStyle();
     restoreButton.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); restorePosition('manual-button'); });
-    box.appendChild(saveButton);
-    box.appendChild(restoreButton);
-    root.appendChild(status);
-    root.appendChild(debug);
-    root.appendChild(box);
+    const historyButton = document.createElement('button');
+    historyButton.type = 'button'; historyButton.textContent = text('history'); historyButton.style.cssText = buttonStyle();
+    historyButton.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); toggleHistoryPanel(); });
+    box.appendChild(saveButton); box.appendChild(restoreButton); box.appendChild(historyButton);
+    root.appendChild(status); root.appendChild(debug); root.appendChild(historyPanel); root.appendChild(box);
     document.documentElement.appendChild(root);
-    state.ui.root = root;
-    state.ui.saveButton = saveButton;
-    state.ui.restoreButton = restoreButton;
-    state.ui.status = status;
-    state.ui.debug = debug;
+    state.ui.root = root; state.ui.saveButton = saveButton; state.ui.restoreButton = restoreButton; state.ui.historyButton = historyButton; state.ui.status = status; state.ui.debug = debug; state.ui.historyPanel = historyPanel;
     if (state.settings.debug) state.ui.debug.style.display = 'block';
   }
 
   function removeUI() {
     if (state.ui.root && state.ui.root.parentNode) state.ui.root.parentNode.removeChild(state.ui.root);
-    state.ui = { root: null, saveButton: null, restoreButton: null, status: null, debug: null };
+    state.ui = { root: null, saveButton: null, restoreButton: null, historyButton: null, status: null, debug: null, historyPanel: null };
   }
 
   function buttonStyle() {
@@ -489,17 +554,8 @@
     window.__xfarPatched = true;
     const originalPushState = history.pushState;
     const originalReplaceState = history.replaceState;
-    history.pushState = function patchedPushState(...args) {
-      savePosition('before-pushState');
-      const result = originalPushState.apply(this, args);
-      setTimeout(() => routeChanged('pushState'), 50);
-      return result;
-    };
-    history.replaceState = function patchedReplaceState(...args) {
-      const result = originalReplaceState.apply(this, args);
-      setTimeout(() => routeChanged('replaceState'), 50);
-      return result;
-    };
+    history.pushState = function patchedPushState(...args) { savePosition('before-pushState'); const result = originalPushState.apply(this, args); setTimeout(() => routeChanged('pushState'), 50); return result; };
+    history.replaceState = function patchedReplaceState(...args) { const result = originalReplaceState.apply(this, args); setTimeout(() => routeChanged('replaceState'), 50); return result; };
     window.addEventListener('popstate', () => setTimeout(() => routeChanged('popstate'), 80));
   }
 
@@ -546,27 +602,12 @@
     await loadSettings();
     try { if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; } catch (_) {}
     state.routeKey = getRouteKey();
-    patchHistory();
-    observeRoute();
-    listenCommands();
-    ensureUI();
-    window.addEventListener('scroll', () => {
-      state.lastScrollY = window.scrollY;
-      if (state.restoring) {
-        if (now() - state.restoreStartedAt > RESTORE.cancelGraceMs) addLog('info', 'scroll:during-restore-save-suppressed', { scrollY: Math.round(window.scrollY) });
-        return;
-      }
-      scheduleSave('scroll');
-    }, { passive: true });
+    patchHistory(); observeRoute(); listenCommands(); ensureUI();
+    window.addEventListener('scroll', () => { state.lastScrollY = window.scrollY; if (state.restoring) { if (now() - state.restoreStartedAt > RESTORE.cancelGraceMs) addLog('info', 'scroll:during-restore-save-suppressed', { scrollY: Math.round(window.scrollY) }); return; } scheduleSave('scroll'); }, { passive: true });
     window.addEventListener('wheel', () => markUserInput('wheel'), { passive: true, capture: true });
     window.addEventListener('touchstart', () => markUserInput('touchstart'), { passive: true, capture: true });
     window.addEventListener('keydown', () => markUserInput('keydown'), true);
-    document.addEventListener('click', (event) => {
-      state.lastUserInputAt = now();
-      const target = event.target instanceof Element ? event.target : null;
-      const link = target ? target.closest('a[href*="/status/"]') : null;
-      if (link && supported()) savePosition('before-status-click');
-    }, true);
+    document.addEventListener('click', (event) => { state.lastUserInputAt = now(); const target = event.target instanceof Element ? event.target : null; const link = target ? target.closest('a[href*="/status/"]') : null; if (link && supported()) savePosition('before-status-click'); }, true);
     await addLog('info', 'init', { routeKey: state.routeKey, articleCount: articles().length, settings: state.settings, scrollRestoration: history.scrollRestoration });
     fastInitialRestoreThenRefine();
   }
