@@ -45,6 +45,7 @@
       margin-top: 8px;
     }
     .primary { background: #1d9bf0; color: white; }
+    .secondary { background: #2f3336; color: #e7e9ea; }
     .danger { background: #f4212e; color: white; }
     select, input[type="number"] {
       background: #16181c;
@@ -53,6 +54,12 @@
       border-radius: 8px;
       padding: 8px;
       width: 100%;
+    }
+    #status {
+      margin-top: 12px;
+      color: #1d9bf0;
+      font-size: 13px;
+      min-height: 18px;
     }
   </style>
 </head>
@@ -84,7 +91,10 @@
   </div>
 
   <button class="primary" id="save">設定を保存</button>
+  <button class="secondary" id="copyLogs">ログをコピー</button>
+  <button class="secondary" id="clearLogs">ログをクリア</button>
   <button class="danger" id="clear">保存位置をすべてクリア</button>
+  <div id="status"></div>
 
   <script src="popup.js"></script>
 </body>
