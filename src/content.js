@@ -23,11 +23,14 @@
   };
 
   const RESTORE = {
-    timeoutMs: 12000,
+    timeoutMs: 14000,
     pollMs: 300,
-    finalAdjustDelayMs: 280,
+    finalAdjustDelayMs: 400,
     statusMinVisibleMs: 1500,
-    cancelGraceMs: 250
+    cancelGraceMs: 250,
+    virtualLoadScrollStep: 1000,
+    virtualLoadMaxSteps: 4,
+    nearbyRangePx: 300
   };
 
   const state = {
@@ -47,6 +50,10 @@
     mo: null
   };
 
+  try {
+    if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+  } catch (_) {}
+
   const now = () => Date.now();
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const get = (keys) => new Promise((resolve) => chrome.storage.local.get(keys, resolve));
@@ -65,15 +72,7 @@
   }
 
   async function addLog(level, event, detail = {}) {
-    const entry = {
-      time: new Date().toISOString(),
-      level,
-      event,
-      routeKey: state.routeKey || getRouteKey(),
-      url: location.href,
-      scrollY: Math.round(window.scrollY),
-      detail
-    };
+    const entry = { time: new Date().toISOString(), level, event, routeKey: state.routeKey || getRouteKey(), url: location.href, scrollY: Math.round(window.scrollY), detail };
     if (state.settings.debug) console.log(PREFIX, entry);
     const data = await get([KEYS.LOGS]);
     const logs = Array.isArray(data[KEYS.LOGS]) ? data[KEYS.LOGS] : [];
@@ -88,26 +87,8 @@
   }
 
   function text(key) {
-    const ja = {
-      restore: '前の位置へ',
-      save: '現在位置を保存',
-      saved: '保存しました',
-      restored: '復元しました',
-      restoredByScroll: 'スクロール位置で復元しました',
-      notFound: 'アンカー未検出。スクロール位置で復元しました',
-      noSaved: '保存位置なし',
-      cancelled: 'ユーザー操作により復元を中断しました'
-    };
-    const en = {
-      restore: 'Back to saved post',
-      save: 'Save position now',
-      saved: 'Saved',
-      restored: 'Restored',
-      restoredByScroll: 'Restored by scroll position',
-      notFound: 'Anchor not found. Restored by scroll position.',
-      noSaved: 'No saved position',
-      cancelled: 'Restore cancelled by user action'
-    };
+    const ja = { restore: '前の位置へ', save: '現在位置を保存', saved: '保存しました', restored: '復元しました', restoredByScroll: 'スクロール位置で復元しました', loading: '復元中...', notFound: 'アンカー未検出。スクロール位置で復元しました', noSaved: '保存位置なし', cancelled: 'ユーザー操作により復元を中断しました' };
+    const en = { restore: 'Back to saved post', save: 'Save position now', saved: 'Saved', restored: 'Restored', restoredByScroll: 'Restored by scroll position', loading: 'Loading...', notFound: 'Anchor not found. Restored by scroll position.', noSaved: 'No saved position', cancelled: 'Restore cancelled by user action' };
     return (lang() === 'ja' ? ja : en)[key] || key;
   }
 
@@ -146,12 +127,13 @@
     return uniqueElements([
       ...document.querySelectorAll('article[data-testid="tweet"]'),
       ...document.querySelectorAll('div[data-testid="cellInnerDiv"] article[data-testid="tweet"]'),
-      ...document.querySelectorAll('div[data-testid="cellInnerDiv"] article')
-    ]);
+      ...document.querySelectorAll('div[data-testid="cellInnerDiv"] article'),
+      ...document.querySelectorAll('div[data-testid="cellInnerDiv"] [data-testid="tweet"]')
+    ]).map((el) => el.closest('article') || el).filter(Boolean);
   }
 
-  function statusInfo(article) {
-    const links = [...article.querySelectorAll('a[href*="/status/"]')];
+  function statusInfo(root) {
+    const links = [...root.querySelectorAll('a[href*="/status/"]')];
     for (const a of links) {
       const href = a.href || a.getAttribute('href') || '';
       const m = href.match(/\/status\/(\d+)/);
@@ -186,25 +168,34 @@
     return ((u && u.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 100);
   }
 
+  function makeAnchorFromItem(item, hs, list, visible, fullyVisible, reason) {
+    const r = item.rect;
+    return { tweetId: item.info.tweetId, href: item.info.href, routeKey: getRouteKey(), offsetTopFromViewport: Math.round(r.top - hs), scrollY: Math.round(window.scrollY), savedAt: now(), author: author(item.article), snippet: snippet(item.article), articleCount: list.length, visibleCount: visible.length, fullyVisibleCount: fullyVisible.length, headerHeight: hs, viewportHeight: window.innerHeight || 800, selectedRect: rectToObject(r), selectedTextLength: item.textLength, selectionReason: reason };
+  }
+
   function visibleAnchor() {
     if (!supported()) return null;
     const hs = headerHeight();
     const vh = window.innerHeight || 800;
+    const currentY = Math.round(window.scrollY);
     const list = articles();
     const visible = [];
+    const nearby = [];
 
     for (const article of list) {
       const rect = article.getBoundingClientRect();
       const info = statusInfo(article);
       if (!info) continue;
+      const absTop = Math.round(currentY + rect.top);
       const fullyVisible = rect.top >= hs && rect.bottom <= vh;
       const partiallyVisible = rect.bottom > hs && rect.top < vh;
-      if (!partiallyVisible) continue;
-      visible.push({ article, rect, info, fullyVisible, textLength: tweetText(article).length, distanceFromTop: Math.abs(rect.top - hs) });
+      const item = { article, rect, info, fullyVisible, partiallyVisible, textLength: tweetText(article).length, distanceFromTop: Math.abs(rect.top - hs), absTop };
+      if (partiallyVisible) visible.push(item);
+      if (Math.abs(absTop - currentY) <= RESTORE.nearbyRangePx) nearby.push({ tweetId: info.tweetId, href: info.href, absTop, rect: rectToObject(rect), textLength: item.textLength, snippet: snippet(article) });
     }
 
     if (!visible.length) {
-      addLog('warn', 'anchor:no-visible-candidates', { articleCount: list.length, headerHeight: hs, viewportHeight: vh });
+      addLog('warn', 'anchor:no-visible-candidates', { articleCount: list.length, headerHeight: hs, viewportHeight: vh, scrollY: currentY });
       return null;
     }
 
@@ -216,33 +207,12 @@
     else if (fullyVisible.length === 1) preferred = fullyVisible;
     else preferred = visible.slice(0, Math.min(3, visible.length));
 
-    preferred.sort((a, b) => {
-      if (b.textLength !== a.textLength) return b.textLength - a.textLength;
-      return a.distanceFromTop - b.distanceFromTop;
-    });
-
+    preferred.sort((a, b) => b.textLength !== a.textLength ? b.textLength - a.textLength : a.distanceFromTop - b.distanceFromTop);
     const best = preferred[0];
-    const r = best.rect;
-    const anchor = {
-      tweetId: best.info.tweetId,
-      href: best.info.href,
-      routeKey: getRouteKey(),
-      offsetTopFromViewport: Math.round(r.top - hs),
-      scrollY: Math.round(window.scrollY),
-      savedAt: now(),
-      author: author(best.article),
-      snippet: snippet(best.article),
-      articleCount: list.length,
-      visibleCount: visible.length,
-      fullyVisibleCount: fullyVisible.length,
-      headerHeight: hs,
-      viewportHeight: vh,
-      selectedRect: rectToObject(r),
-      selectedTextLength: best.textLength,
-      selectionReason: fullyVisible.length >= 2 ? 'prefer-2nd-or-3rd-fully-visible-long-text' : 'fallback-visible-candidate'
-    };
+    const anchor = makeAnchorFromItem(best, hs, list, visible, fullyVisible, fullyVisible.length >= 2 ? 'prefer-2nd-or-3rd-fully-visible-long-text' : 'fallback-visible-candidate');
+    anchor.nearbyAnchors = nearby.slice(0, 8);
 
-    addLog('info', 'anchor:selected', { tweetId: anchor.tweetId, routeKey: anchor.routeKey, selectionReason: anchor.selectionReason, selectedRect: anchor.selectedRect, selectedTextLength: anchor.selectedTextLength, visibleCount: anchor.visibleCount, fullyVisibleCount: anchor.fullyVisibleCount });
+    addLog('info', 'anchor:selected', { tweetId: anchor.tweetId, routeKey: anchor.routeKey, selectionReason: anchor.selectionReason, selectedRect: anchor.selectedRect, nearbyCount: anchor.nearbyAnchors.length, visibleCount: anchor.visibleCount, fullyVisibleCount: anchor.fullyVisibleCount });
     return anchor;
   }
 
@@ -271,10 +241,13 @@
   function findArticle(tweetId) {
     const id = String(tweetId || '').replace(/\D/g, '');
     if (!id) return null;
-    const links = [...document.querySelectorAll(`a[href*="/status/${id}"]`)];
-    for (const link of links) {
-      const article = link.closest('article') || link.closest('div[data-testid="cellInnerDiv"]');
-      if (article) return article;
+    const selectors = [`a[href*="/status/${id}"]`, `div[data-testid="cellInnerDiv"] a[href*="/status/${id}"]`, `article a[href*="/status/${id}"]`];
+    for (const selector of selectors) {
+      const links = [...document.querySelectorAll(selector)];
+      for (const link of links) {
+        const article = link.closest('article') || link.closest('div[data-testid="cellInnerDiv"]') || link.closest('[data-testid="tweet"]');
+        if (article) return article;
+      }
     }
     return null;
   }
@@ -290,6 +263,26 @@
 
   function restoreCancelled(sessionId) {
     return state.restoreCancelled || sessionId !== state.restoreSessionId;
+  }
+
+  async function adjustToTarget(target, saved, sessionId, label) {
+    target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
+    await sleep(RESTORE.finalAdjustDelayMs);
+    if (restoreCancelled(sessionId)) return { cancelled: true };
+    const hs1 = headerHeight();
+    const rect1 = target.getBoundingClientRect();
+    const desired = Number(saved.offsetTopFromViewport) || 0;
+    const delta1 = Math.round((rect1.top - hs1) - desired);
+    if (Math.abs(delta1) > 2) window.scrollBy(0, delta1);
+    await sleep(160);
+    const hs2 = headerHeight();
+    const rect2 = target.getBoundingClientRect();
+    const delta2 = Math.round((rect2.top - hs2) - desired);
+    if (Math.abs(delta2) > 2) window.scrollBy(0, delta2);
+    await sleep(80);
+    const rect3 = target.getBoundingClientRect();
+    await addLog('info', 'restore:adjusted', { sessionId, label, desiredOffset: desired, header1: hs1, header2: hs2, delta1, delta2, rect1: rectToObject(rect1), rect2: rectToObject(rect2), rect3: rectToObject(rect3), finalScrollY: Math.round(window.scrollY) });
+    return { cancelled: false, delta1, delta2, finalRect: rectToObject(rect3) };
   }
 
   async function restorePosition(reason = 'auto') {
@@ -311,18 +304,20 @@
     state.restoring = true;
     state.restoreCancelled = false;
     state.restoreStartedAt = now();
-    await addLog('info', 'restore:start', { reason, sessionId, saved });
+    setStatus(text('loading'), RESTORE.statusMinVisibleMs);
+    await addLog('info', 'restore:start', { reason, sessionId, saved, scrollRestoration: history.scrollRestoration });
 
     let didScrollFallback = false;
     let found = false;
     let attempts = 0;
+    let virtualLoadSteps = 0;
 
     try {
       if (typeof saved.scrollY === 'number' && saved.scrollY > 0) {
         window.scrollTo(0, saved.scrollY);
         didScrollFallback = true;
         await addLog('info', 'restore:fallback-scrollY', { sessionId, scrollY: saved.scrollY });
-        await sleep(120);
+        await sleep(150);
       }
       const started = now();
       while (now() - started < RESTORE.timeoutMs) {
@@ -331,26 +326,22 @@
           return false;
         }
         attempts++;
-        const target = findArticle(saved.tweetId);
+        let target = findArticle(saved.tweetId);
+        let targetSource = 'primary';
+        if (!target && Array.isArray(saved.nearbyAnchors)) {
+          for (const near of saved.nearbyAnchors) {
+            target = findArticle(near.tweetId);
+            if (target) { targetSource = 'nearby:' + near.tweetId; break; }
+          }
+        }
         if (target) {
           const beforeRect = target.getBoundingClientRect();
-          await addLog('info', 'restore:anchor-found', { sessionId, attempts, tweetId: saved.tweetId, beforeRect: rectToObject(beforeRect), savedOffsetTopFromViewport: saved.offsetTopFromViewport, savedScrollY: saved.scrollY });
-          target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
-          await sleep(RESTORE.finalAdjustDelayMs);
-          if (restoreCancelled(sessionId)) {
-            await addLog('warn', 'restore:cancelled-before-final-adjust', { sessionId, attempts });
-            return false;
-          }
-          const hs = headerHeight();
-          const afterRect = target.getBoundingClientRect();
-          const desired = Number(saved.offsetTopFromViewport) || 0;
-          const delta = Math.round((afterRect.top - hs) - desired);
-          if (Math.abs(delta) > 2) window.scrollBy(0, delta);
-          await sleep(80);
-          const finalRect = target.getBoundingClientRect();
+          await addLog('info', 'restore:anchor-found', { sessionId, attempts, targetSource, tweetId: saved.tweetId, beforeRect: rectToObject(beforeRect), savedOffsetTopFromViewport: saved.offsetTopFromViewport, savedScrollY: saved.scrollY, currentScrollY: Math.round(window.scrollY) });
+          const adjusted = await adjustToTarget(target, saved, sessionId, targetSource);
+          if (adjusted.cancelled) return false;
           found = true;
           setStatus(`${text('restored')}: ${saved.tweetId}`, RESTORE.statusMinVisibleMs);
-          await addLog('info', 'restore:anchor-ok', { sessionId, attempts, tweetId: saved.tweetId, headerHeight: hs, desiredOffset: desired, delta, afterRect: rectToObject(afterRect), finalRect: rectToObject(finalRect), finalScrollY: Math.round(window.scrollY) });
+          await addLog('info', 'restore:anchor-ok', { sessionId, attempts, targetSource, tweetId: saved.tweetId, adjusted });
           break;
         }
         if (attempts === 5 && typeof saved.scrollY === 'number' && saved.scrollY > 0) {
@@ -358,11 +349,18 @@
           didScrollFallback = true;
           await addLog('info', 'restore:retry-fallback-scrollY', { sessionId, attempts, scrollY: saved.scrollY });
         }
-        await sleep(RESTORE.pollMs);
+        if (attempts >= 6 && virtualLoadSteps < RESTORE.virtualLoadMaxSteps) {
+          virtualLoadSteps++;
+          window.scrollBy(0, RESTORE.virtualLoadScrollStep);
+          await addLog('info', 'restore:virtual-load-scroll', { sessionId, attempts, virtualLoadSteps, stepPx: RESTORE.virtualLoadScrollStep, scrollY: Math.round(window.scrollY) });
+          await sleep(500);
+        } else {
+          await sleep(RESTORE.pollMs);
+        }
       }
       if (!found) {
         setStatus(didScrollFallback ? text('restoredByScroll') : text('notFound'), RESTORE.statusMinVisibleMs);
-        await addLog('warn', 'restore:anchor-not-found', { sessionId, attempts, tweetId: saved.tweetId, didScrollFallback, savedScrollY: saved.scrollY, currentScrollY: Math.round(window.scrollY), articleCount: articles().length });
+        await addLog('warn', 'restore:anchor-not-found', { sessionId, attempts, virtualLoadSteps, tweetId: saved.tweetId, didScrollFallback, savedScrollY: saved.scrollY, currentScrollY: Math.round(window.scrollY), articleCount: articles().length, nearbyCount: Array.isArray(saved.nearbyAnchors) ? saved.nearbyAnchors.length : 0 });
       }
       return found;
     } finally {
@@ -387,18 +385,13 @@
     state.ui.status.textContent = message;
     state.ui.status.style.display = 'block';
     clearTimeout(state.statusTimer);
-    state.statusTimer = setTimeout(() => {
-      if (state.ui.status) state.ui.status.style.display = 'none';
-    }, Math.max(1500, minVisibleMs));
+    state.statusTimer = setTimeout(() => { if (state.ui.status) state.ui.status.style.display = 'none'; }, Math.max(1500, minVisibleMs));
   }
 
   function updateDebug(entry) {
     ensureUI();
     if (!state.ui.debug) return;
-    if (!state.settings.debug) {
-      state.ui.debug.style.display = 'none';
-      return;
-    }
+    if (!state.settings.debug) { state.ui.debug.style.display = 'none'; return; }
     state.ui.debug.style.display = 'block';
     state.ui.debug.textContent = entry ? [`${entry.level} ${entry.event}`, `route=${entry.routeKey}`, `Y=${entry.scrollY}`, `time=${entry.time}`].join('\n') : '';
   }
@@ -474,10 +467,7 @@
 
   function observeRoute() {
     if (state.mo) state.mo.disconnect();
-    state.mo = new MutationObserver(() => {
-      if (state.url !== location.href) routeChanged('mutation');
-      ensureUI();
-    });
+    state.mo = new MutationObserver(() => { if (state.url !== location.href) routeChanged('mutation'); ensureUI(); });
     state.mo.observe(document.documentElement, { childList: true, subtree: true });
   }
 
@@ -504,6 +494,7 @@
 
   async function init() {
     await loadSettings();
+    try { if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; } catch (_) {}
     state.routeKey = getRouteKey();
     patchHistory();
     observeRoute();
@@ -526,7 +517,7 @@
       const link = target ? target.closest('a[href*="/status/"]') : null;
       if (link && supported()) savePosition('before-status-click');
     }, true);
-    await addLog('info', 'init', { routeKey: state.routeKey, articleCount: articles().length, settings: state.settings });
+    await addLog('info', 'init', { routeKey: state.routeKey, articleCount: articles().length, settings: state.settings, scrollRestoration: history.scrollRestoration });
     setTimeout(() => savePosition('initial-scan'), 1200);
     setTimeout(() => restorePosition('initial-load'), 1800);
   }
