@@ -282,6 +282,40 @@
     return hit / Math.max(aa.size, bb.size);
   }
 
+  function ensureSelfNearbyAnchor(anchor, bestInfo, bestRect, absTop) {
+    if (!anchor || !bestInfo) return anchor;
+
+    const selfNearby = {
+      tweetId: bestInfo.tweetId,
+      href: bestInfo.href,
+      absTop: typeof absTop === 'number'
+        ? absTop
+        : Math.round((anchor.scrollY || 0) + ((bestRect && bestRect.top) || 0)),
+      rect: rectToObject(bestRect),
+      author: anchor.author,
+      snippet: anchor.snippet,
+      textLength: anchor.textLength,
+      self: true
+    };
+
+    const existing = Array.isArray(anchor.nearbyAnchors)
+      ? anchor.nearbyAnchors.filter((item) => String(item && item.tweetId) !== String(bestInfo.tweetId))
+      : [];
+
+    anchor.nearbyAnchors = [selfNearby, ...existing].slice(0, CONFIG.nearbyLimit || 20);
+    anchor.selfAnchor = {
+      tweetId: selfNearby.tweetId,
+      href: selfNearby.href,
+      absTop: selfNearby.absTop,
+      rect: selfNearby.rect,
+      author: selfNearby.author,
+      snippet: selfNearby.snippet,
+      textLength: selfNearby.textLength
+    };
+
+    return anchor;
+  }
+
   function visibleAnchor() {
     if (!isSupportedRoute()) return null;
 
@@ -317,7 +351,9 @@
         visible.push(item);
       }
 
-      if (Math.abs(absTop - currentY) <= CONFIG.nearbyRangePx) {
+      const inViewport = rect.bottom > 0 && rect.top < vh;
+      const nearScroll = Math.abs(absTop - currentY) <= CONFIG.nearbyRangePx;
+      if (inViewport || nearScroll) {
         nearby.push({
           tweetId: info.tweetId,
           href: info.href,
@@ -375,12 +411,16 @@
       selectedRect: rectToObject(r),
       nearbyAnchors: nearby.slice(0, CONFIG.nearbyLimit)
     };
+    ensureSelfNearbyAnchor(anchor, best.info, best.rect, best.absTop);
 
     addLog('info', 'anchor:selected', {
       tweetId: anchor.tweetId,
       routeKey: anchor.routeKey,
       scrollY: anchor.scrollY,
-      nearbyCount: anchor.nearbyAnchors.length
+      nearbyCount: anchor.nearbyAnchors.length,
+      hasSelfNearbyAnchor: Array.isArray(anchor.nearbyAnchors) && anchor.nearbyAnchors.some((item) => String(item && item.tweetId) === String(anchor.tweetId)),
+      nearbyTweetIds: Array.isArray(anchor.nearbyAnchors) ? anchor.nearbyAnchors.map((item) => item && item.tweetId) : [],
+      selfAnchorAbsTop: anchor.selfAnchor && anchor.selfAnchor.absTop
     });
 
     return anchor;
@@ -455,6 +495,9 @@
   }
 
   function getSelfAnchor(saved) {
+    if (saved && saved.selfAnchor && String(saved.selfAnchor.tweetId) === String(saved.tweetId)) {
+      return { ...saved.selfAnchor, self: true };
+    }
     return saved && Array.isArray(saved.nearbyAnchors)
       ? saved.nearbyAnchors.find((anchor) => String(anchor && anchor.tweetId) === String(saved.tweetId)) || null
       : null;
@@ -816,6 +859,14 @@
 
     try {
       const self = getSelfAnchor(saved);
+      if (!self) {
+        await addLog('info', options.historyMode ? 'history:self-anchor-missing' : 'restore:self-anchor-missing', {
+          tweetId: saved.tweetId,
+          nearbyTweetIds: Array.isArray(saved.nearbyAnchors) ? saved.nearbyAnchors.map((item) => item && item.tweetId) : [],
+          hasSelfAnchorField: Boolean(saved.selfAnchor),
+          hasNearbyAnchors: Array.isArray(saved.nearbyAnchors) && saved.nearbyAnchors.length > 0
+        });
+      }
       if (self && typeof self.absTop === 'number') {
         const offset = saved.offsetTopFromViewport ?? (self.rect && self.rect.top) ?? 200;
         const targetScrollY = Math.max(0, self.absTop - offset);
