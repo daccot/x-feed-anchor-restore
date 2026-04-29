@@ -445,7 +445,7 @@
 
     const authorSim = textSimilarity(articleAuthor, saved.author);
     if (authorSim > 0) {
-      const v = Math.round(authorSim * 30);
+      const v = Math.round(authorSim * 10);
       score += v;
       reasons.push(`author:+${v}`);
     }
@@ -473,6 +473,40 @@
       if (v > 0) {
         score += v;
         reasons.push(`viewportOffset:+${v}`);
+      }
+    }
+
+    if (Array.isArray(saved.nearbyAnchors) && saved.nearbyAnchors.length) {
+      let maxNearbySnippetSim = 0;
+      let maxNearbyAuthorSim = 0;
+      let minAbsTopDist = Infinity;
+
+      for (const nearby of saved.nearbyAnchors) {
+        maxNearbySnippetSim = Math.max(maxNearbySnippetSim, textSimilarity(articleSnippet, nearby && nearby.snippet));
+        maxNearbyAuthorSim = Math.max(maxNearbyAuthorSim, textSimilarity(articleAuthor, nearby && nearby.author));
+        if (typeof nearby.absTop === 'number') {
+          minAbsTopDist = Math.min(minAbsTopDist, Math.abs(absTop - nearby.absTop));
+        }
+      }
+
+      if (maxNearbySnippetSim > 0) {
+        const v = Math.round(maxNearbySnippetSim * 40);
+        score += v;
+        reasons.push(`nearbySnippet:+${v}`);
+      }
+
+      if (maxNearbyAuthorSim > 0) {
+        const v = Math.round(maxNearbyAuthorSim * 20);
+        score += v;
+        reasons.push(`nearbyAuthor:+${v}`);
+      }
+
+      if (Number.isFinite(minAbsTopDist)) {
+        const v = Math.max(0, Math.round(30 - minAbsTopDist / 80));
+        if (v > 0) {
+          score += v;
+          reasons.push(`nearbyAbsTop:+${v}`);
+        }
       }
     }
 
@@ -696,6 +730,9 @@
     let found = false;
     let virtualLoadSteps = 0;
     let attempts = 0;
+    let boundedSearchIndex = 0;
+    let virtualLoadAborted = false;
+    const searchOffsets = [0, -600, 600, -1200, 1200];
 
     try {
       if (typeof saved.scrollY === 'number' && saved.scrollY > 0) {
@@ -711,6 +748,68 @@
         }
 
         await sleep(options.fast ? 60 : 160);
+      }
+
+      boundedSearchIndex = didScrollFallback ? 1 : 0;
+
+      async function tryRelativeOffsetCorrection(mode) {
+        const eventPrefix = mode === 'history' ? 'history' : 'restore';
+        const ref = saved && saved.nearbyAnchors && saved.nearbyAnchors[0];
+        const beforeScrollY = Math.round(window.scrollY);
+        let reason = '';
+        let best = null;
+        let delta = null;
+
+        if (!ref) {
+          reason = 'no-nearby-anchor';
+        } else {
+          const result = await findBestCandidate(saved, { historyMode: mode === 'history' });
+          best = result.best;
+
+          if (!best) {
+            reason = 'no-best-candidate';
+          } else if (typeof ref.absTop !== 'number' || typeof best.absTop !== 'number') {
+            reason = 'missing-absTop';
+          } else {
+            delta = best.absTop - ref.absTop;
+            const predictedScrollY = beforeScrollY + delta;
+
+            if (mode === 'restore' &&
+                typeof saved.scrollY === 'number' &&
+                Math.abs(predictedScrollY - saved.scrollY) >= 2500) {
+              reason = 'predicted-scroll-too-far';
+            } else if (Math.abs(delta) > 30 && Math.abs(delta) < (mode === 'history' ? 3000 : 2500)) {
+              window.scrollBy(0, delta);
+              await addLog('info', `${eventPrefix}:relative-offset-corrected`, {
+                sessionId,
+                tweetId: saved.tweetId,
+                referenceTweetId: ref.tweetId,
+                bestTweetId: best.info && best.info.tweetId,
+                referenceAbsTop: ref.absTop,
+                bestAbsTop: best.absTop,
+                delta,
+                beforeScrollY,
+                afterScrollY: Math.round(window.scrollY)
+              });
+              setStatus(t('restoredByScroll'));
+              return true;
+            } else {
+              reason = 'delta-out-of-range';
+            }
+          }
+        }
+
+        await addLog('info', `${eventPrefix}:relative-offset-skipped`, {
+          sessionId,
+          tweetId: saved.tweetId,
+          reason,
+          referenceTweetId: ref && ref.tweetId,
+          bestTweetId: best && best.info && best.info.tweetId,
+          referenceAbsTop: ref && ref.absTop,
+          bestAbsTop: best && best.absTop,
+          delta
+        });
+        return false;
       }
 
       const started = now();
@@ -767,10 +866,42 @@
           break;
         }
 
-        if (!options.noVirtualLoad &&
+        if (!options.historyMode &&
+            typeof saved.scrollY === 'number' &&
+            boundedSearchIndex < searchOffsets.length) {
+          const offset = searchOffsets[boundedSearchIndex++];
+          const targetScrollY = Math.max(0, saved.scrollY + offset);
+          window.scrollTo(0, targetScrollY);
+          await addLog('info', 'restore:bounded-search-scroll', {
+            sessionId,
+            attempts,
+            targetScrollY,
+            offset,
+            savedScrollY: saved.scrollY
+          });
+          await sleep(220);
+        } else if (!options.noVirtualLoad &&
             !options.historyMode &&
+            !virtualLoadAborted &&
             attempts >= 6 &&
             virtualLoadSteps < CONFIG.virtualLoadMaxSteps) {
+          const currentScrollY = Math.round(window.scrollY);
+          const distance = typeof saved.scrollY === 'number'
+            ? Math.abs(currentScrollY - saved.scrollY)
+            : null;
+          if (typeof distance === 'number' && distance > 1500) {
+            virtualLoadAborted = true;
+            window.scrollTo(0, saved.scrollY);
+            await addLog('info', 'restore:virtual-load-aborted', {
+              sessionId,
+              attempts,
+              currentScrollY,
+              savedScrollY: saved.scrollY,
+              distance,
+              reason: 'too-far-from-saved-scrollY'
+            });
+            await sleep(160);
+          } else {
           virtualLoadSteps++;
           window.scrollBy(0, CONFIG.virtualLoadStepPx);
           await addLog('info', 'restore:virtual-load-scroll', {
@@ -778,73 +909,20 @@
             attempts,
             virtualLoadSteps,
             stepPx: CONFIG.virtualLoadStepPx,
-            scrollY: Math.round(window.scrollY)
+            scrollY: Math.round(window.scrollY),
+            savedScrollY: saved.scrollY
           });
           await sleep(500);
+          }
         } else {
           await sleep(CONFIG.restorePollMs);
         }
       }
 
       if (!found) {
-        if (options.historyMode) {
-          const ref = saved && saved.nearbyAnchors && saved.nearbyAnchors[0];
-          const beforeScrollY = Math.round(window.scrollY);
-          let reason = '';
-          let best = null;
-          let delta = null;
-          let relativeCorrected = false;
-
-          if (!ref) {
-            reason = 'no-nearby-anchor';
-          } else {
-            const result = await findBestCandidate(saved, { historyMode: true });
-            best = result.best;
-
-            if (!best) {
-              reason = 'no-best-candidate';
-            } else if (typeof ref.absTop !== 'number' || typeof best.absTop !== 'number') {
-              reason = 'missing-absTop';
-            } else {
-              delta = best.absTop - ref.absTop;
-
-              if (Math.abs(delta) > 30 && Math.abs(delta) < 3000) {
-                window.scrollBy(0, delta);
-                relativeCorrected = true;
-                await addLog('info', 'history:relative-offset-corrected', {
-                  sessionId,
-                  tweetId: saved.tweetId,
-                  referenceTweetId: ref.tweetId,
-                  bestTweetId: best.info && best.info.tweetId,
-                  referenceAbsTop: ref.absTop,
-                  bestAbsTop: best.absTop,
-                  delta,
-                  beforeScrollY,
-                  afterScrollY: Math.round(window.scrollY)
-                });
-              } else {
-                reason = 'delta-out-of-range';
-              }
-            }
-          }
-
-          if (relativeCorrected) {
-            setStatus(t('restoredByScroll'));
-            return true;
-          }
-
-          if (reason) {
-            await addLog('info', 'history:relative-offset-skipped', {
-              sessionId,
-              tweetId: saved.tweetId,
-              reason,
-              referenceTweetId: ref && ref.tweetId,
-              bestTweetId: best && best.info && best.info.tweetId,
-              referenceAbsTop: ref && ref.absTop,
-              bestAbsTop: best && best.absTop,
-              delta
-            });
-          }
+        const relativeCorrected = await tryRelativeOffsetCorrection(options.historyMode ? 'history' : 'restore');
+        if (relativeCorrected) {
+          return options.historyMode;
         }
 
         if (options.historyMode && typeof saved.scrollY === 'number' && saved.scrollY > 0) {
@@ -859,6 +937,21 @@
           });
           setStatus(t('restoredByScroll'));
           return true;
+        }
+
+        if (!options.historyMode && didScrollFallback && typeof saved.scrollY === 'number') {
+          const beforeScrollY = Math.round(window.scrollY);
+          window.scrollTo(0, saved.scrollY);
+          await addLog('info', 'restore:preserve-scrollY', {
+            sessionId,
+            tweetId: saved.tweetId,
+            savedScrollY: saved.scrollY,
+            beforeScrollY,
+            afterScrollY: Math.round(window.scrollY),
+            attempts,
+            virtualLoadSteps
+          });
+          setStatus(t('restoredByScroll'));
         }
 
         setStatus(didScrollFallback ? t('restoredByScroll') : t('noSaved'));
