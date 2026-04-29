@@ -441,6 +441,16 @@
     return null;
   }
 
+  function findExactCandidate(tweetId) {
+    return findTweetById(tweetId);
+  }
+
+  function getSelfAnchor(saved) {
+    return saved && Array.isArray(saved.nearbyAnchors)
+      ? saved.nearbyAnchors.find((anchor) => String(anchor && anchor.tweetId) === String(saved.tweetId)) || null
+      : null;
+  }
+
   function scoreCandidate(article, saved) {
     const info = statusInfo(article);
     if (!info || !saved) return { score: -1 };
@@ -454,6 +464,8 @@
     const reasons = [];
 
     if (String(info.tweetId) === String(saved.tweetId)) {
+      score += 200;
+      reasons.push('savedTweetId:+200');
       score += 120;
       reasons.push('tweetId:+120');
     }
@@ -777,6 +789,41 @@
     const searchOffsets = [0, -600, 600, -1200, 1200];
 
     try {
+      const self = getSelfAnchor(saved);
+      if (self && typeof self.absTop === 'number') {
+        const offset = saved.offsetTopFromViewport ?? (self.rect && self.rect.top) ?? 200;
+        const targetScrollY = Math.max(0, self.absTop - offset);
+
+        window.scrollTo(0, targetScrollY);
+        await sleep(250);
+
+        await addLog('info', options.historyMode ? 'history:self-anchor-scroll' : 'restore:self-anchor-scroll', {
+          sessionId,
+          tweetId: saved.tweetId,
+          selfAbsTop: self.absTop,
+          offset,
+          targetScrollY,
+          savedScrollY: saved.scrollY
+        });
+
+        const exact = findExactCandidate(saved.tweetId);
+        if (exact) {
+          const adjusted = await adjustToTarget(exact, saved, sessionId, 'self-anchor-exact');
+          if (!adjusted.cancelled) {
+            setStatus(`${t('restored')}: ${saved.tweetId}`);
+            await addLog('info', options.historyMode ? 'history:self-anchor-exact-found' : 'restore:self-anchor-exact-found', {
+              sessionId,
+              tweetId: saved.tweetId
+            });
+            scheduleDriftCheck(exact, saved, sessionId);
+            return true;
+          }
+        }
+
+        setStatus(t('restoredByScroll'));
+        return false;
+      }
+
       if (typeof saved.scrollY === 'number' && saved.scrollY > 0) {
         window.scrollTo(0, saved.scrollY);
         didScrollFallback = true;
