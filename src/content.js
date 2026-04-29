@@ -27,10 +27,16 @@
     pollMs: 300,
     finalAdjustDelayMs: 400,
     statusMinVisibleMs: 1500,
+    loadingStatusMs: 4500,
     cancelGraceMs: 250,
     virtualLoadScrollStep: 1000,
     virtualLoadMaxSteps: 4,
-    nearbyRangePx: 300
+    nearbyRangePx: 300,
+    nearbyLimit: 16,
+    initialMinArticles: 10,
+    initialReadyTimeoutMs: 12000,
+    initialRetryMax: 3,
+    initialRetryBaseDelayMs: 900
   };
 
   const state = {
@@ -44,6 +50,8 @@
     restoreSessionId: 0,
     restoreStartedAt: 0,
     restoreCancelled: false,
+    timelineReadyObserver: null,
+    timelineReadyStarted: false,
     lastScrollY: window.scrollY,
     lastUserInputAt: 0,
     ui: { root: null, saveButton: null, restoreButton: null, status: null, debug: null },
@@ -61,14 +69,7 @@
 
   function rectToObject(rect) {
     if (!rect) return null;
-    return {
-      top: Math.round(rect.top),
-      right: Math.round(rect.right),
-      bottom: Math.round(rect.bottom),
-      left: Math.round(rect.left),
-      width: Math.round(rect.width),
-      height: Math.round(rect.height)
-    };
+    return { top: Math.round(rect.top), right: Math.round(rect.right), bottom: Math.round(rect.bottom), left: Math.round(rect.left), width: Math.round(rect.width), height: Math.round(rect.height) };
   }
 
   async function addLog(level, event, detail = {}) {
@@ -87,8 +88,8 @@
   }
 
   function text(key) {
-    const ja = { restore: '前の位置へ', save: '現在位置を保存', saved: '保存しました', restored: '復元しました', restoredByScroll: 'スクロール位置で復元しました', loading: '復元中...', notFound: 'アンカー未検出。スクロール位置で復元しました', noSaved: '保存位置なし', cancelled: 'ユーザー操作により復元を中断しました' };
-    const en = { restore: 'Back to saved post', save: 'Save position now', saved: 'Saved', restored: 'Restored', restoredByScroll: 'Restored by scroll position', loading: 'Loading...', notFound: 'Anchor not found. Restored by scroll position.', noSaved: 'No saved position', cancelled: 'Restore cancelled by user action' };
+    const ja = { restore: '前の位置へ', save: '現在位置を保存', saved: '保存しました', restored: '復元しました', restoredByScroll: 'スクロール位置で復元しました', loading: '復元中...', waitingTimeline: 'タイムライン読み込み待機中...', notFound: 'アンカー未検出。スクロール位置で復元しました', noSaved: '保存位置なし', cancelled: 'ユーザー操作により復元を中断しました' };
+    const en = { restore: 'Back to saved post', save: 'Save position now', saved: 'Saved', restored: 'Restored', restoredByScroll: 'Restored by scroll position', loading: 'Loading...', waitingTimeline: 'Waiting for timeline...', notFound: 'Anchor not found. Restored by scroll position.', noSaved: 'No saved position', cancelled: 'Restore cancelled by user action' };
     return (lang() === 'ja' ? ja : en)[key] || key;
   }
 
@@ -200,6 +201,7 @@
     }
 
     visible.sort((a, b) => a.rect.top - b.rect.top);
+    nearby.sort((a, b) => b.textLength - a.textLength);
     const fullyVisible = visible.filter((item) => item.fullyVisible);
     let preferred;
     if (fullyVisible.length >= 3) preferred = fullyVisible.slice(1, 3);
@@ -210,7 +212,7 @@
     preferred.sort((a, b) => b.textLength !== a.textLength ? b.textLength - a.textLength : a.distanceFromTop - b.distanceFromTop);
     const best = preferred[0];
     const anchor = makeAnchorFromItem(best, hs, list, visible, fullyVisible, fullyVisible.length >= 2 ? 'prefer-2nd-or-3rd-fully-visible-long-text' : 'fallback-visible-candidate');
-    anchor.nearbyAnchors = nearby.slice(0, 8);
+    anchor.nearbyAnchors = nearby.slice(0, RESTORE.nearbyLimit);
 
     addLog('info', 'anchor:selected', { tweetId: anchor.tweetId, routeKey: anchor.routeKey, selectionReason: anchor.selectionReason, selectedRect: anchor.selectedRect, nearbyCount: anchor.nearbyAnchors.length, visibleCount: anchor.visibleCount, fullyVisibleCount: anchor.fullyVisibleCount });
     return anchor;
@@ -265,6 +267,34 @@
     return state.restoreCancelled || sessionId !== state.restoreSessionId;
   }
 
+  async function waitForTimelineReady(reason) {
+    const started = now();
+    setStatus(text('waitingTimeline'), RESTORE.loadingStatusMs);
+    await addLog('info', 'timeline-ready:wait-start', { reason, minArticles: RESTORE.initialMinArticles });
+    return new Promise((resolve) => {
+      let done = false;
+      let interval = null;
+      let observer = null;
+      const finish = (ok, why) => {
+        if (done) return;
+        done = true;
+        if (interval) clearInterval(interval);
+        if (observer) observer.disconnect();
+        addLog(ok ? 'info' : 'warn', 'timeline-ready:finish', { ok, why, elapsedMs: now() - started, articleCount: articles().length });
+        resolve(ok);
+      };
+      const check = () => {
+        const count = articles().length;
+        if (count >= RESTORE.initialMinArticles) finish(true, 'article-count');
+        else if (now() - started >= RESTORE.initialReadyTimeoutMs) finish(false, 'timeout');
+      };
+      observer = new MutationObserver(check);
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      interval = setInterval(check, 250);
+      check();
+    });
+  }
+
   async function adjustToTarget(target, saved, sessionId, label) {
     target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
     await sleep(RESTORE.finalAdjustDelayMs);
@@ -304,8 +334,8 @@
     state.restoring = true;
     state.restoreCancelled = false;
     state.restoreStartedAt = now();
-    setStatus(text('loading'), RESTORE.statusMinVisibleMs);
-    await addLog('info', 'restore:start', { reason, sessionId, saved, scrollRestoration: history.scrollRestoration });
+    setStatus(text('loading'), RESTORE.loadingStatusMs);
+    await addLog('info', 'restore:start', { reason, sessionId, saved, scrollRestoration: history.scrollRestoration, articleCount: articles().length });
 
     let didScrollFallback = false;
     let found = false;
@@ -317,7 +347,7 @@
         window.scrollTo(0, saved.scrollY);
         didScrollFallback = true;
         await addLog('info', 'restore:fallback-scrollY', { sessionId, scrollY: saved.scrollY });
-        await sleep(150);
+        await sleep(180);
       }
       const started = now();
       while (now() - started < RESTORE.timeoutMs) {
@@ -371,6 +401,26 @@
         }
       }, 900);
     }
+  }
+
+  async function initialRestoreWithRetry() {
+    if (!supported()) return;
+    if (state.timelineReadyStarted) return;
+    state.timelineReadyStarted = true;
+    const ready = await waitForTimelineReady('initial-load');
+    for (let i = 1; i <= RESTORE.initialRetryMax; i++) {
+      const delay = i === 1 ? 0 : RESTORE.initialRetryBaseDelayMs * (i - 1);
+      if (delay) await sleep(delay);
+      setStatus(`${text('loading')} (${i}/${RESTORE.initialRetryMax})`, RESTORE.loadingStatusMs);
+      await addLog('info', 'initial-restore:attempt', { attempt: i, ready, articleCount: articles().length, delay });
+      const ok = await restorePosition('initial-load');
+      if (ok) {
+        await addLog('info', 'initial-restore:success', { attempt: i });
+        return true;
+      }
+    }
+    await addLog('warn', 'initial-restore:failed-after-retry', { retryMax: RESTORE.initialRetryMax, articleCount: articles().length });
+    return false;
   }
 
   function scheduleSave(reason) {
@@ -460,6 +510,7 @@
     const old = state.url;
     state.url = location.href;
     state.routeKey = getRouteKey();
+    state.timelineReadyStarted = false;
     addLog('info', 'route:changed', { reason, old, next: state.url, routeKey: state.routeKey });
     clearTimeout(state.routeTimer);
     state.routeTimer = setTimeout(() => restorePosition(`route-${reason}`), 900);
@@ -518,8 +569,7 @@
       if (link && supported()) savePosition('before-status-click');
     }, true);
     await addLog('info', 'init', { routeKey: state.routeKey, articleCount: articles().length, settings: state.settings, scrollRestoration: history.scrollRestoration });
-    setTimeout(() => savePosition('initial-scan'), 1200);
-    setTimeout(() => restorePosition('initial-load'), 1800);
+    initialRestoreWithRetry();
   }
 
   init().catch((error) => console.error(PREFIX, error));
